@@ -94,7 +94,7 @@ def _existing(uri: str, local: Path) -> bool:
 def _validate(
     path: Path, change: dict[str, Any], scenario: dict[str, Any], tier: str
 ) -> None:
-    count = 3 if tier == "cheap" else 20
+    count = {"cheap": 3, "expensive": 20, "baseline": 50}[tier]
     table = pq.read_table(path)
     if table.schema != _SCHEMA:
         raise ValueError(f"Invalid completed rollout schema: {path}")
@@ -114,12 +114,16 @@ def _validate(
         raise ValueError(f"Invalid completed rollout key: {path}")
 
 
-def run_shard(env: str, shard: int, shards: int) -> list[str]:
+def run_shard(
+    env: str, shard: int, shards: int, *, baseline: bool = False
+) -> list[str]:
     """Run one change shard and preserve validated, completed rollout keys."""
     if env not in _ENVS or type(shards) is not int or shards <= 0:
         raise ValueError("env must be supported and shards must be a positive integer")
     if type(shard) is not int or not 0 <= shard < shards:
         raise ValueError("shard must be in [0, shards)")
+    if type(baseline) is not bool:
+        raise ValueError("baseline must be a boolean")
     root = os.environ.get("BRIER_DATA", "").rstrip("/")
     if not root or ("://" in root and not root.startswith("gs://")):
         raise ValueError("BRIER_DATA must be a local directory or gs:// bucket prefix")
@@ -148,9 +152,17 @@ def run_shard(env: str, shard: int, shards: int) -> list[str]:
         try:
             env_id, policy = _ENVS[env]
             changes = [c for c in definitions["changes"] if c["env"] == env_id]
-            for change in changes[shard::shards]:
-                for scenario in scenarios(env_id):
-                    for tier, count in (("cheap", 3), ("expensive", 20)):
+            for change in changes[:1] if baseline else changes[shard::shards]:
+                selected = (
+                    scenarios(env_id)[shard::shards] if baseline else scenarios(env_id)
+                )
+                for scenario in selected:
+                    tiers = (
+                        (("baseline", 50),)
+                        if baseline
+                        else (("cheap", 3), ("expensive", 20))
+                    )
+                    for tier, count in tiers:
                         key = f"episodes/{env}/{change['change_id']}/{scenario['scenario_id']}/{tier}.parquet"
                         destination = local / key
                         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -190,6 +202,9 @@ if __name__ == "__main__":
     parser.add_argument("--env", required=True, choices=_ENVS)
     parser.add_argument("--shard", required=True, type=int)
     parser.add_argument("--shards", required=True, type=int)
+    parser.add_argument("--baseline", action="store_true")
     arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    run_shard(arguments.env, arguments.shard, arguments.shards)
+    run_shard(
+        arguments.env, arguments.shard, arguments.shards, baseline=arguments.baseline
+    )
