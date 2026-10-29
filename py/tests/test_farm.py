@@ -1,12 +1,56 @@
 import json
 import os
+import shlex
+import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from brier_sim import farm
+
+_TRAJECTORY = {
+    "collision_steps": 0,
+    "action_direction_changes": 0,
+    "action_transitions": 1,
+    "object_max_height": 0.0,
+    "object_final_height": 0.0,
+    "goal_distance_min": 1.0,
+    "goal_distance_final": 1.0,
+}
+
+
+def _raw_file(
+    path: Path,
+    change: dict[str, Any],
+    scenario: dict[str, Any],
+    tier: str,
+    **overrides: Any,
+) -> Path:
+    count = {"cheap": 3, "expensive": 20, "baseline": 50}[tier]
+    rows = [
+        {
+            "env": change["env"],
+            "policy": "lerobot/diffusion_pusht",
+            "change_id": change["change_id"],
+            "scenario_id": scenario["scenario_id"],
+            "tier": tier,
+            "seed": seed,
+            "success": False,
+            "steps": 2,
+            "terminal_state": json.dumps({"trajectory": _TRAJECTORY}),
+            "reward_sum": 0.0,
+            "keyframes_uri": None,
+            "wall_seconds": 0.1,
+            **overrides,
+        }
+        for seed in scenario["seeds"][:count]
+    ]
+    pq.write_table(pa.Table.from_pylist(rows, schema=farm._SCHEMA), path)
+    return path
 
 
 def test_catalog_has_global_ids_fixed_scenarios_and_benign_fraction() -> None:
@@ -63,7 +107,7 @@ def test_shard_keys_skip_valid_results_and_reject_corruption(
                         "seed": seed + i,
                         "success": False,
                         "steps": 2,
-                        "terminal_state": "{}",
+                        "terminal_state": json.dumps({"trajectory": _TRAJECTORY}),
                         "reward_sum": 0.0,
                         "keyframes_uri": None,
                         "wall_seconds": 0.1,
@@ -99,8 +143,6 @@ def test_shard_rejects_invalid_partition(env: str, shard: int, shards: int) -> N
 def test_cloud_permission_error_is_not_treated_as_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from types import SimpleNamespace
-
     monkeypatch.setattr(
         farm.subprocess,
         "run",
@@ -164,3 +206,187 @@ def test_baselines_shard_scenarios_and_run_fifty_unmodified_episodes(
     ]
     assert farm.run_shard("aloha_transfer_cube", 1, 4, baseline=True) == keys
     assert len(calls) == 4
+
+
+@pytest.mark.parametrize(
+    "prefix", ["gs://", "gs:///", "gs:bucket", "gs://bucket?x=1", "https://bucket", " "]
+)
+def test_rejects_invalid_storage_prefix_before_creating_files(
+    prefix: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BRIER_DATA", prefix)
+    monkeypatch.setattr(
+        farm, "catalog", lambda: pytest.fail("invalid prefix reached catalog")
+    )
+    with pytest.raises(ValueError, match="BRIER_DATA"):
+        farm.run_shard("pusht", 0, 1)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"steps": 0},
+        {"terminal_state": "not JSON"},
+        {"terminal_state": "[]"},
+        {"terminal_state": "{}"},
+        {
+            "terminal_state": json.dumps(
+                {"trajectory": {**_TRAJECTORY, "collision_steps": -1}}
+            )
+        },
+        {
+            "terminal_state": json.dumps(
+                {"trajectory": {**_TRAJECTORY, "collision_steps": True}}
+            )
+        },
+        {
+            "terminal_state": json.dumps(
+                {"trajectory": {**_TRAJECTORY, "collision_steps": float("nan")}}
+            )
+        },
+        {
+            "terminal_state": json.dumps(
+                {"trajectory": {**_TRAJECTORY, "action_direction_changes": 2}}
+            )
+        },
+        {
+            "terminal_state": json.dumps(
+                {"trajectory": {**_TRAJECTORY, "goal_distance_min": 2}}
+            )
+        },
+    ],
+)
+def test_rejects_completed_records_that_cannot_be_labeled(
+    tmp_path: Path,
+    overrides: dict[str, Any],
+) -> None:
+    change = farm.catalog()["changes"][0]
+    scenario = farm.scenarios(change["env"])[0]
+    path = _raw_file(
+        tmp_path / "bad.parquet", change, scenario, "expensive", **overrides
+    )
+    with pytest.raises(ValueError, match="completed rollout"):
+        farm._validate(path, change, scenario, "expensive")
+
+
+@pytest.mark.parametrize("winner", ["catalog", "episode"])
+def test_remote_upload_validates_concurrent_winner_and_restores_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    winner: str,
+) -> None:
+    prefix = "gs://brier-test/rollouts"
+    monkeypatch.setenv("BRIER_DATA", prefix)
+    definitions = farm.catalog()
+    definitions["changes"] = definitions["changes"][:1]
+    scenario = definitions["scenarios"][0]
+    definitions["scenarios"] = [scenario]
+    monkeypatch.setattr(farm, "catalog", lambda: definitions)
+    monkeypatch.setattr(farm, "scenarios", lambda _: [scenario])
+    cloud: dict[str, bytes] = {}
+    calls: list[str] = []
+
+    def gcloud(arguments: list[str], **kwargs: Any) -> SimpleNamespace:
+        if arguments[2] == "objects":
+            return SimpleNamespace(
+                returncode=0 if arguments[4] in cloud else 1, stderr="404 Not Found"
+            )
+        source, destination = arguments[-2:]
+        if source.startswith("gs://"):
+            assert "--no-clobber" not in arguments
+            Path(destination).write_bytes(cloud[source])
+        else:
+            assert "--no-clobber" in arguments
+            if winner == "catalog" and destination.endswith("catalog.json"):
+                cloud[destination] = b'{"different": "catalog"}'
+            elif winner == "episode" and destination.endswith("cheap.parquet"):
+                bad = _raw_file(
+                    tmp_path / "winner.parquet",
+                    definitions["changes"][0],
+                    scenario,
+                    "cheap",
+                    steps=0,
+                )
+                cloud[destination] = bad.read_bytes()
+            else:
+                cloud.setdefault(destination, Path(source).read_bytes())
+        return SimpleNamespace(returncode=0, stderr="")
+
+    def run(
+        env: str,
+        policy: str,
+        count: int,
+        seed: int,
+        change_id: str,
+        scenario_id: str,
+        tier: str,
+        **kwargs: Any,
+    ) -> Path:
+        calls.append(tier)
+        return _raw_file(
+            Path(os.environ["BRIER_DATA"]) / "raw.parquet",
+            definitions["changes"][0],
+            scenario,
+            tier,
+        )
+
+    monkeypatch.setattr(farm.subprocess, "run", gcloud)
+    monkeypatch.setattr(farm, "run_episodes", run)
+    with pytest.raises(
+        ValueError,
+        match="catalog differs" if winner == "catalog" else "completed rollout key",
+    ):
+        farm.run_shard("pusht", 0, 1)
+    assert calls == ([] if winner == "catalog" else ["cheap"])
+    assert os.environ["BRIER_DATA"] == prefix
+
+
+def test_failed_download_preserves_cache_and_removes_partial_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = tmp_path / "cached.parquet"
+    cache.write_bytes(b"previous valid cache")
+
+    def gcloud(arguments: list[str], **kwargs: Any) -> SimpleNamespace:
+        if arguments[2] == "objects":
+            return SimpleNamespace(returncode=0, stderr="")
+        Path(arguments[-1]).write_bytes(b"partial download")
+        raise farm.subprocess.CalledProcessError(1, arguments)
+
+    monkeypatch.setattr(farm.subprocess, "run", gcloud)
+    with pytest.raises(farm.subprocess.CalledProcessError):
+        farm._existing("gs://brier-test/episode.parquet", cache)
+    assert cache.read_bytes() == b"previous valid cache"
+    assert list(tmp_path.iterdir()) == [cache]
+
+
+def test_spot_worker_fails_before_installing_when_native_library_is_missing(
+    tmp_path: Path,
+) -> None:
+    for name, command in [("uname", "echo Linux"), ("gcloud", "exit 0")]:
+        path = tmp_path / name
+        path.write_text(f"#!/bin/sh\n{command}\n")
+        path.chmod(0o755)
+    wrapper = tmp_path / "python3.11"
+    code = "import ctypes.util,sys; ctypes.util.find_library=lambda name:None; exec(sys.stdin.read())"
+    wrapper.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(code)}\n"
+    )
+    wrapper.chmod(0o755)
+    repository = Path(farm.__file__).resolve().parents[2]
+    result = subprocess.run(
+        ["bash", str(repository / "py/brier_sim/gcp_spot.sh"), "pusht", "0", "1"],
+        check=False,
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+            "BRIER_DATA": "gs://brier-test/rollouts",
+        },
+    )
+    assert result.returncode != 0
+    assert "Missing native EGL library" in result.stderr
