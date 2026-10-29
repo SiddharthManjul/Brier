@@ -1,0 +1,46 @@
+name: Rollouts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: brier-rollouts
+  cancel-in-progress: false
+
+jobs:
+  rollouts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        env: [pusht, aloha_transfer_cube]
+        shard: [0, 1, 2, 3]
+    env:
+      BRIER_DATA: ${{ vars.BRIER_DATA }}
+      MUJOCO_GL: egl
+      PYOPENGL_PLATFORM: egl
+      HF_HUB_DISABLE_XET: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Install simulation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libgles2 libopengl0
+          pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .
+      - name: Run change shard
+        run: python -m brier_sim.farm --env '${{ matrix.env }}' --shard '${{ matrix.shard }}' --shards 4
