@@ -2,15 +2,21 @@ use std::{
     fs,
     path::PathBuf,
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 fn temporary_directory() -> PathBuf {
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("brier-cli-{}-{nonce}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "brier-cli-{}-{nonce}-{}",
+        std::process::id(),
+        NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn init_command() -> Command {
