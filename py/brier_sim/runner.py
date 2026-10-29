@@ -17,6 +17,7 @@ from lerobot.envs.utils import preprocess_observation
 
 from brier_sim.changes import apply_change
 from brier_sim.scenarios import apply_scenario, scenarios
+from brier_sim.telemetry import snapshot, summarize
 
 if TYPE_CHECKING:
     from lerobot.policies.pretrained import PreTrainedPolicy
@@ -164,6 +165,7 @@ def run_episodes(
             torch.manual_seed(episode_seed)
             pretrained_policy.reset()
             observation, info = gym_env.reset(seed=episode_seed)
+            snapshots, actions = [snapshot(gym_env)], []
             success = False
             steps, reward_sum = 0, 0.0
             terminated = truncated = False
@@ -180,11 +182,16 @@ def run_episodes(
                     observation, reward, terminated, truncated, info = gym_env.step(
                         action
                     )
+                    actions.append(action.copy())
+                    snapshots.append(snapshot(gym_env))
                     success = bool(info["is_success"]) or success
                     reward_sum += float(reward)
                     steps += 1
             terminal_state = dict(
-                info, terminated=bool(terminated), truncated=bool(truncated)
+                info,
+                terminated=bool(terminated),
+                truncated=bool(truncated),
+                trajectory=summarize(actions, snapshots),
             )
             if env == "gym_aloha/AlohaTransferCube-v0":
                 physics = gym_env.unwrapped._env.physics
