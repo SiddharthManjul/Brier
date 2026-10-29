@@ -16,6 +16,8 @@ dependencies = [
     "gym-pusht==0.1.8",
     "gym-aloha==0.1.5",
     "pyarrow==20.0.0",
+    "lightgbm>=4.6,<5",
+    "scikit-learn>=1.7,<2",
 ]
 
 [project.optional-dependencies]
