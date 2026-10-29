@@ -16,6 +16,7 @@ import torch
 from lerobot.envs.utils import preprocess_observation
 
 from brier_sim.changes import apply_change
+from brier_sim.scenarios import apply_scenario, scenarios
 
 if TYPE_CHECKING:
     from lerobot.policies.pretrained import PreTrainedPolicy
@@ -93,6 +94,7 @@ def run_episodes(
     tier: str,
     *,
     change: dict[str, Any] | None = None,
+    scenario: dict[str, Any] | None = None,
 ) -> Path:
     """Run seeded pretrained-policy episodes and save their raw records to Parquet."""
     if env == "gym_pusht/PushT-v0":
@@ -110,6 +112,15 @@ def run_episodes(
         raise ValueError("seed must be a nonnegative integer")
     if tier not in ("cheap", "expensive", "baseline"):
         raise ValueError("tier must be cheap, expensive, or baseline")
+    if scenario is not None and (
+        scenario not in scenarios(env)
+        or scenario["scenario_id"] != scenario_id
+        or seed != scenario["seeds"][0]
+        or episodes > len(scenario["seeds"])
+    ):
+        raise ValueError(
+            "scenario, first seed and episode count must match its fixed definition"
+        )
     if (
         not isinstance(change_id, str)
         or not re.fullmatch(r"c[0-9]{3,}", change_id)
@@ -139,12 +150,16 @@ def run_episodes(
     rows = []
     try:
         gym_env, pretrained_policy = _load(env, policy, tier)
+        if scenario is not None:
+            gym_env = apply_scenario(gym_env, scenario, tier)
         if change is not None:
             pretrained_policy = apply_change(
                 pretrained_policy, change, seed=int(change_id[1:])
             )
         for index in range(episodes):
-            episode_seed = seed + index
+            episode_seed = (
+                seed + index if scenario is None else scenario["seeds"][index]
+            )
             started = time.perf_counter()
             torch.manual_seed(episode_seed)
             pretrained_policy.reset()
