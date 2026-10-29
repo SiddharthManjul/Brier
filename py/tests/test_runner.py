@@ -116,6 +116,11 @@ def test_runner_persists_raw_telemetry_and_typed_schema(rollout: _Rollout) -> No
         terminal = json.loads(row["terminal_state"])
         assert terminal["terminated"] is False
         assert terminal["truncated"] is True
+        trajectory = terminal["trajectory"]
+        assert trajectory["action_transitions"] == 0
+        assert trajectory["collision_steps"] == 0
+        assert trajectory["object_final_height"] == 0
+        assert trajectory["goal_distance_final"] >= trajectory["goal_distance_min"]
         for key, value in episode[-1][4].items():
             np.testing.assert_equal(terminal[key], value)
         assert row["keyframes_uri"] is None
