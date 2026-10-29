@@ -110,3 +110,57 @@ def test_cloud_permission_error_is_not_treated_as_missing(
     )
     with pytest.raises(RuntimeError, match="403"):
         farm._existing("gs://example/episode.parquet", Path("unused"))
+
+
+def test_baselines_shard_scenarios_and_run_fifty_unmodified_episodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BRIER_DATA", str(tmp_path))
+    calls = []
+
+    def run(
+        env: str,
+        policy: str,
+        count: int,
+        seed: int,
+        change_id: str,
+        scenario_id: str,
+        tier: str,
+        **kwargs: Any,
+    ) -> Path:
+        calls.append((change_id, scenario_id, tier, count))
+        assert kwargs["change"]["families"] == [{"family": "benign", "params": {}}]
+        output = tmp_path / "raw.parquet"
+        pq.write_table(
+            pa.Table.from_pylist(
+                [
+                    {
+                        "env": env,
+                        "policy": policy,
+                        "change_id": change_id,
+                        "scenario_id": scenario_id,
+                        "tier": tier,
+                        "seed": seed + i,
+                        "success": True,
+                        "steps": 400,
+                        "terminal_state": "{}",
+                        "reward_sum": 4.0,
+                        "keyframes_uri": None,
+                        "wall_seconds": 1.0,
+                    }
+                    for i in range(count)
+                ],
+                schema=farm._SCHEMA,
+            ),
+            output,
+        )
+        return output
+
+    monkeypatch.setattr(farm, "run_episodes", run)
+    keys = farm.run_shard("aloha_transfer_cube", 1, 4, baseline=True)
+    assert len(keys) == 4
+    assert calls == [
+        ("c081", f"aloha_transfer_cube-s{i:02}", "baseline", 50) for i in (2, 6, 10, 14)
+    ]
+    assert farm.run_shard("aloha_transfer_cube", 1, 4, baseline=True) == keys
+    assert len(calls) == 4
