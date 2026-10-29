@@ -5,7 +5,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import gymnasium as gym
@@ -14,6 +14,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 from lerobot.envs.utils import preprocess_observation
+
+from brier_sim.changes import apply_change
 
 if TYPE_CHECKING:
     from lerobot.policies.pretrained import PreTrainedPolicy
@@ -89,6 +91,8 @@ def run_episodes(
     change_id: str,
     scenario_id: str,
     tier: str,
+    *,
+    change: dict[str, Any] | None = None,
 ) -> Path:
     """Run seeded pretrained-policy episodes and save their raw records to Parquet."""
     if env == "gym_pusht/PushT-v0":
@@ -135,6 +139,10 @@ def run_episodes(
     rows = []
     try:
         gym_env, pretrained_policy = _load(env, policy, tier)
+        if change is not None:
+            pretrained_policy = apply_change(
+                pretrained_policy, change, seed=int(change_id[1:])
+            )
         for index in range(episodes):
             episode_seed = seed + index
             started = time.perf_counter()

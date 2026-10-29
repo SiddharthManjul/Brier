@@ -143,6 +143,65 @@ def test_runner_repeats_environment_and_torch_seeds(
     assert len(environments) == 2 and all(env.closed for env in environments)
 
 
+def test_runner_applies_ordered_change_card(
+    rollout: _Rollout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, environment, policy = rollout
+    raw_actions: list[torch.Tensor] = []
+    sent_actions: list[np.ndarray] = []
+    change_seeds: list[int] = []
+    select_action, step, apply = (
+        policy.select_action,
+        environment.step,
+        runner.apply_change,
+    )
+
+    def select(observation: dict[str, torch.Tensor]) -> torch.Tensor:
+        action = select_action(observation)
+        raw_actions.append(action.clone())
+        return action
+
+    def send(action: np.ndarray) -> _Step:
+        sent_actions.append(action.copy())
+        return step(action)
+
+    def wrap(base: Any, card: dict[str, Any], *, seed: int) -> Any:
+        change_seeds.append(seed)
+        return apply(base, card, seed=seed)
+
+    monkeypatch.setattr(policy, "select_action", select)
+    monkeypatch.setattr(environment, "step", send)
+    monkeypatch.setattr(runner, "apply_change", wrap)
+    card = {
+        "description": "Retune gain and introduce controller drift",
+        "families": [
+            {"family": "action_scale", "params": {"scale": 0.8}},
+            {"family": "action_bias", "params": {"drift": 0.1}},
+        ],
+    }
+    runner.run_episodes(*ARGS, change=card)
+    assert change_seeds == [1]
+    assert policy.resets == 3 and environment.closed
+    assert len(sent_actions) == len(raw_actions) == 4
+    for index, (raw, sent) in enumerate(zip(raw_actions, sent_actions, strict=True)):
+        expected = raw.squeeze(0).numpy() * 0.8 + 0.1 * (index % 2 + 1)
+        np.testing.assert_allclose(sent, expected)
+
+
+def test_runner_closes_environment_when_change_card_is_invalid(
+    rollout: _Rollout,
+) -> None:
+    directory, environment, _ = rollout
+    card = {
+        "description": "Invalid gain",
+        "families": [{"family": "action_scale", "params": {"scale": -1}}],
+    }
+    with pytest.raises(ValueError):
+        runner.run_episodes(*ARGS, change=card)
+    assert environment.closed
+    assert not list(directory.rglob("*.parquet"))
+
+
 @pytest.mark.parametrize(
     "index,value,message",
     [
