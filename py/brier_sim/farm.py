@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -69,7 +70,9 @@ def catalog() -> dict[str, Any]:
 
 def _copy(source: str, destination: str) -> None:
     subprocess.run(
-        ["gcloud", "storage", "cp", "--no-clobber", source, destination],
+        ["gcloud", "storage", "cp"]
+        + (["--no-clobber"] if destination.startswith("gs://") else [])
+        + [source, destination],
         check=True,
         capture_output=True,
         text=True,
@@ -87,7 +90,15 @@ def _existing(uri: str, local: Path) -> bool:
         if "404" in result.stderr or "not found" in result.stderr.lower():
             return False
         raise RuntimeError(f"Cannot inspect {uri}: {result.stderr.strip()}")
-    _copy(uri, str(local))
+    with tempfile.NamedTemporaryFile(
+        dir=local.parent, prefix=f".{local.name}-", delete=False
+    ) as download:
+        downloaded = Path(download.name)
+    try:
+        _copy(uri, str(downloaded))
+        downloaded.replace(local)
+    finally:
+        downloaded.unlink(missing_ok=True)
     return True
 
 
@@ -106,12 +117,52 @@ def _validate(
         or row["tier"] != tier
         or row["policy"] != next(p for e, p in _ENVS.values() if e == change["env"])
         or row["seed"] != scenario["seeds"][i]
+        or type(row["success"]) is not bool
+        or type(row["steps"]) is not int
+        or row["steps"] <= 0
         or not np.isfinite(row["wall_seconds"])
         or row["wall_seconds"] < 0
         or not np.isfinite(row["reward_sum"])
         for i, row in enumerate(rows)
     ):
         raise ValueError(f"Invalid completed rollout key: {path}")
+    for row in rows:
+        try:
+            terminal = json.loads(row["terminal_state"])
+            json.dumps(terminal, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Invalid completed rollout terminal JSON: {path}"
+            ) from error
+        if not isinstance(terminal, dict):
+            raise ValueError(f"Invalid completed rollout terminal object: {path}")  # noqa: TRY004
+        if row["success"] or tier == "cheap":
+            continue
+        trajectory = terminal.get("trajectory")
+        metrics = (
+            "collision_steps",
+            "action_direction_changes",
+            "action_transitions",
+            "object_max_height",
+            "object_final_height",
+            "goal_distance_min",
+            "goal_distance_final",
+        )
+        if not isinstance(trajectory, dict) or any(
+            type(trajectory.get(key)) not in (int, float)
+            or not np.isfinite(trajectory[key])
+            or trajectory[key] < 0
+            for key in metrics
+        ):
+            raise ValueError(f"Invalid completed rollout failure telemetry: {path}")
+        if (
+            trajectory["action_direction_changes"] > trajectory["action_transitions"]
+            or trajectory["goal_distance_min"]
+            > trajectory["goal_distance_final"] + 1e-9
+        ):
+            raise ValueError(
+                f"Inconsistent completed rollout failure telemetry: {path}"
+            )
 
 
 def run_shard(
@@ -124,10 +175,26 @@ def run_shard(
         raise ValueError("shard must be in [0, shards)")
     if type(baseline) is not bool:
         raise ValueError("baseline must be a boolean")
-    root = os.environ.get("BRIER_DATA", "").rstrip("/")
-    if not root or ("://" in root and not root.startswith("gs://")):
+    raw_root = os.environ.get("BRIER_DATA", "")
+    parsed = urlsplit(raw_root)
+    remote = parsed.scheme == "gs"
+    if (
+        not raw_root.strip()
+        or (parsed.scheme and not remote)
+        or (
+            remote
+            and (
+                not raw_root.startswith("gs://")
+                or not parsed.netloc
+                or parsed.query
+                or parsed.fragment
+                or "@" in parsed.netloc
+                or ":" in parsed.netloc
+            )
+        )
+    ):
         raise ValueError("BRIER_DATA must be a local directory or gs:// bucket prefix")
-    remote = root.startswith("gs://")
+    root = raw_root.rstrip("/") if remote else raw_root
     definitions = catalog()
     completed: list[str] = []
     with tempfile.TemporaryDirectory(prefix="brier-rollouts-") as temporary:
@@ -139,14 +206,16 @@ def run_shard(
             exists = _existing(f"{root}/catalog.json", metadata)
         else:
             exists = metadata.exists()
-        if exists and metadata.read_text() != content:
-            raise ValueError(
-                "Existing catalog differs from deterministic rollout definitions"
-            )
         if not exists:
             metadata.write_text(content)
             if remote:
                 _copy(str(metadata), f"{root}/catalog.json")
+                if not _existing(f"{root}/catalog.json", metadata):
+                    raise RuntimeError("Uploaded rollout catalog is missing")
+        if metadata.read_text() != content:
+            raise ValueError(
+                "Existing catalog differs from deterministic rollout definitions"
+            )
         previous = os.environ["BRIER_DATA"]
         os.environ["BRIER_DATA"] = str(local)
         try:
@@ -190,6 +259,11 @@ def run_shard(
                             result.replace(destination)
                             if remote:
                                 _copy(str(destination), uri)
+                                if not _existing(uri, destination):
+                                    raise RuntimeError(
+                                        f"Uploaded rollout is missing: {uri}"
+                                    )
+                                _validate(destination, change, scenario, tier)
                         completed.append(uri)
                         _LOG.info("Completed %s", uri)
         finally:
