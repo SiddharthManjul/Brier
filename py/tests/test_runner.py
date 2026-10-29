@@ -143,6 +143,30 @@ def test_runner_repeats_environment_and_torch_seeds(
     assert len(environments) == 2 and all(env.closed for env in environments)
 
 
+def test_runner_uses_fixed_scenario_seed_prefix(rollout: _Rollout) -> None:
+    _, environment, _ = rollout
+    scenario = runner.scenarios(ENV)[3]
+    args = (
+        ENV,
+        POLICY,
+        2,
+        scenario["seeds"][0],
+        "c001",
+        scenario["scenario_id"],
+        "cheap",
+    )
+    rows = pq.read_table(runner.run_episodes(*args, scenario=scenario)).to_pylist()
+    assert environment.seeds == scenario["seeds"][:2]
+    assert [row["seed"] for row in rows] == scenario["seeds"][:2]
+    assert environment.closed
+
+
+def test_runner_rejects_inconsistent_scenario_before_loading(rollout: _Rollout) -> None:
+    scenario = runner.scenarios(ENV)[0]
+    with pytest.raises(ValueError, match="scenario"):
+        runner.run_episodes(*ARGS, scenario=scenario)
+
+
 def test_runner_applies_ordered_change_card(
     rollout: _Rollout, monkeypatch: pytest.MonkeyPatch
 ) -> None:
