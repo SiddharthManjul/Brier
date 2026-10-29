@@ -24,6 +24,19 @@ command -v python3.11 >/dev/null
 [[ -f pyproject.toml && -f py/brier_sim/farm.py ]] || {
   echo 'Run this script from the Brier repository root' >&2; exit 2;
 }
+python3.11 - <<'PY'
+import ctypes
+import ctypes.util
+
+for library in ("EGL", "GL", "GLESv2", "OpenGL"):
+    path = ctypes.util.find_library(library)
+    if path is None:
+        raise SystemExit(f"Missing native {library} library; provision libegl1, libgl1, libgles2 and libopengl0 before running the spot worker")
+    try:
+        ctypes.CDLL(path)
+    except OSError as error:
+        raise SystemExit(f"Cannot load native {library} library: {error}") from error
+PY
 
 python3.11 -m venv .venv
 .venv/bin/python -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
