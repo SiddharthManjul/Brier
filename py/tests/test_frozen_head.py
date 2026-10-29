@@ -6,9 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torch import nn
-
 from brier_ml import frozen_head as frozen
+from torch import nn
 
 _VALUES = {
     "regressed": ["no", "yes"],
