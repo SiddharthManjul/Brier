@@ -2,6 +2,11 @@ name: Rollouts
 
 on:
   workflow_dispatch:
+    inputs:
+      baseline:
+        description: Run the once-per-scenario 50-episode baselines
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -43,4 +48,4 @@ jobs:
           pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
           pip install -e .
       - name: Run change shard
-        run: python -m brier_sim.farm --env '${{ matrix.env }}' --shard '${{ matrix.shard }}' --shards 4
+        run: python -m brier_sim.farm --env '${{ matrix.env }}' --shard '${{ matrix.shard }}' --shards 4 ${{ inputs.baseline && '--baseline' || '' }}
