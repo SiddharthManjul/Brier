@@ -3,6 +3,8 @@ use std::{env, fs, path::PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+mod label;
+
 #[derive(Parser)]
 #[command(name = "brier")]
 struct Cli {
@@ -12,6 +14,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Label {
+        #[arg(long)]
+        ledger: PathBuf,
+        #[arg(long)]
+        episodes: PathBuf,
+        #[arg(long)]
+        catalog: PathBuf,
+    },
     Ledger {
         #[command(subcommand)]
         command: LedgerCommand,
@@ -25,6 +35,11 @@ enum LedgerCommand {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Label {
+            ledger,
+            episodes,
+            catalog,
+        } => label::label(&ledger, &episodes, &catalog)?,
         Command::Ledger {
             command: LedgerCommand::Init,
         } => {
