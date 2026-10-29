@@ -1,0 +1,15 @@
+/target/
+/.venv/
+/.ruff_cache/
+/.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+/data/
+.env
+.env.*
+.DS_Store
+**/node_modules/
+/apps/web/.next/
