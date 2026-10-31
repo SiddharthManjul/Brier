@@ -334,4 +334,36 @@ fn score_explanations_separates_heldout_splits_and_never_fills_missing_metrics_w
         .as_str()
         .unwrap()
         .contains("not causal proof"));
+    let source = fs::read_to_string(&compiled).unwrap();
+    let mut rows = Vec::new();
+    for line in source.lines() {
+        let row: Value = serde_json::from_str(line).unwrap();
+        let parts: Vec<_> = row["id"].as_str().unwrap().split('/').collect();
+        rows.push(json!({"id":format!("{}:{}:regressed:ev",parts[0],parts[1]),
+            "pair_id":format!("{}:{}",parts[0],parts[1]),"change_id":parts[0],"scenario_id":parts[1],
+            "env":"pusht","variant":"ev","question":"regressed","options":["yes","no"],
+            "prompt":"fixture<answer>","label":"A","split":row["split"]}));
+    }
+    fs::write(
+        &compiled,
+        rows.iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    assert_eq!(
+        brier_core::explain::score_explanations(&f.ledger, &compiled)
+            .unwrap()
+            .unwrap(),
+        metrics
+    );
+    rows[0]["change_id"] = json!("c999");
+    fs::write(
+        &compiled,
+        rows.iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    assert!(brier_core::explain::score_explanations(&f.ledger, &compiled).is_err());
 }
