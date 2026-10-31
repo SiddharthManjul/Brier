@@ -1,0 +1,18 @@
+[project]
+name = "brier-glimmer-training"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "modal==1.6.3",
+    "torch==2.15.0",
+    "transformers==5.22.1",
+    "peft==0.21.2",
+    "accelerate==1.15.0",
+    "safetensors==0.8.0",
+    "huggingface-hub==2.4.0",
+    "bitsandbytes==0.50.2",
+    "numpy==2.4.6",
+    "scipy==1.17.1",
+    "scikit-learn==1.9.1",
+    "pytest==9.2.0",
+]
