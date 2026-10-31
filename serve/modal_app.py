@@ -60,8 +60,8 @@ def score_options(generate: _Generate, tokenizer: Any,
         ):
             raise ValueError("prompt or question options do not match the compiled contract")
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
-        if not 1 <= len(prompt_ids) <= 1535:
-            raise ValueError("compiled prompt must fit the 1536-token sequence with one answer")
+        if not 1 <= len(prompt_ids) <= 1536:
+            raise ValueError("compiled prompt must fit 1536 tokens before the answer")
         ids = []
         for letter in sorted(options):
             encoded = tokenizer.encode(" " + letter, add_special_tokens=False)
@@ -168,7 +168,7 @@ def _load() -> tuple[_Generate, Any, str]:
     engine = LLM(
         model=model, revision=revision, tokenizer_revision=revision,
         dtype="bfloat16", trust_remote_code=False, language_model_only=True,
-        enable_prefix_caching=True, max_model_len=1536, max_logprobs=20,
+        enable_prefix_caching=True, max_model_len=1537, max_logprobs=20,
         logprobs_mode="raw_logprobs", seed=0, **lora_options,
     )
     tokenizer = engine.get_tokenizer()
