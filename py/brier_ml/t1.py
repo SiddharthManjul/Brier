@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -81,9 +82,16 @@ def train_t1(dataset: Dataset, output: Path) -> dict[str, Any]:
     isotonic = IsotonicRegression(out_of_bounds="clip").fit(probabilities, labels[calibration])
     artifact = {
         "format_version": 1, "feature_names": names.copy(),
+        "training_change_ids": sorted({change for change, split in zip(dataset["changes"], splits, strict=True)
+                                       if split == "train"}),
+        "calibration_change_ids": sorted({change for change, split in zip(dataset["changes"], splits, strict=True)
+                                          if split == "calibration"}),
         "booster": model.booster_.dump_model(),
         "isotonic": {"x": isotonic.X_thresholds_.tolist(), "y": isotonic.y_thresholds_.tolist()},
     }
+    artifact["model_version"] = "t1@" + hashlib.sha256(
+        json.dumps(artifact, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
     exported = predict_t1(artifact, features)
     expected = isotonic.predict(model.booster_.predict(features))
     if not np.allclose(exported, expected, atol=1e-12, rtol=1e-12):
