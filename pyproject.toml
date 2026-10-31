@@ -16,10 +16,12 @@ dependencies = [
     "gym-pusht==0.1.8",
     "gym-aloha==0.1.5",
     "pyarrow==20.0.0",
+    "google-cloud-storage==3.17.1",
     "lightgbm>=4.6,<5",
     "scikit-learn>=1.7,<2",
     "modal==1.6.3",
     "fastapi==0.162.0",
+    "meta-sam-parser==0.1.0",
 ]
 
 [project.optional-dependencies]
