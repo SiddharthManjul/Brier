@@ -35,6 +35,11 @@ def _load(env_name: str) -> tuple[gym.vector.SyncVectorEnv, Any]:
         r"[0-9a-f]{40}", pin["revision"]
     ):
         raise ValueError("policy pins must name the expected repository and immutable revision")
+    if "num_inference_steps" in pin and (
+        env_name != "pusht" or type(pin["num_inference_steps"]) is not int
+        or pin["num_inference_steps"] <= 0
+    ):
+        raise ValueError("num_inference_steps must be a positive integer for pusht only")
     checkpoint = snapshot_download(
         pin["repo_id"], revision=pin["revision"], allow_patterns=["*.json", "*.safetensors"]
     )
@@ -44,6 +49,8 @@ def _load(env_name: str) -> tuple[gym.vector.SyncVectorEnv, Any]:
         assert isinstance(env, gym.vector.SyncVectorEnv) and env.num_envs == 1
         config = PreTrainedConfig.from_pretrained(checkpoint, cli_overrides=["--device=cpu"])
         config.pretrained_path = Path(checkpoint)
+        if "num_inference_steps" in pin:
+            config.num_inference_steps = pin["num_inference_steps"]
         policy = make_policy(cfg=config, env_cfg=env_cfg)
         load_model(policy, str(Path(checkpoint) / "model.safetensors"), strict=True, device="cpu")
         policy.eval()
