@@ -29,6 +29,19 @@ _FAMILIES = {"obs_noise", "action_latency", "action_scale", "action_bias", "came
              "occlusion", "brightness", "frame_drop", "chunk_len", "weight_noise", "benign"}
 
 
+def calibration_partition(change_ids: Iterable[str]) -> tuple[list[str], list[str]]:
+    """Reserve nineteen calibration changes before any fitting or model selection."""
+    ids = set(change_ids)
+    if any(not isinstance(change, str) or not re.fullmatch(r"c[0-9]{3,}", change)
+           or change != f"c{int(change[1:]):03}" or int(change[1:]) == 0 for change in ids):
+        raise ValueError("Calibration partition requires canonical cNNN change IDs")
+    if len(ids) < 20:
+        raise ValueError("Calibration partition requires at least 20 unique changes")
+    ordered = sorted(ids, key=lambda change: (
+        hashlib.sha256(f"risk-calibration:{change}:2026".encode()).digest(), change))
+    return sorted(ordered[19:]), sorted(ordered[:19])
+
+
 def _validate(row: Any, identities: set[str], splits: dict[str, str]) -> None:
     if (not isinstance(row, dict) or set(row) != _FIELDS
             or any(not isinstance(row[key], str) for key in _FIELDS - {"options"})):
