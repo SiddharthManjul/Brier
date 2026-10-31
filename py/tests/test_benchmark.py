@@ -33,7 +33,7 @@ def rollouts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, 
                 "change_id": change_id,
                 "scenario_id": scenario_id,
                 "tier": tier,
-                "seed": seed + i,
+                "seed": kwargs["scenario"]["seeds"][i],
                 "wall_seconds": float(i + 1),
             }
             for i in range(episodes)
