@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
+import socket
 import subprocess
+import sys
 import tempfile
-from pathlib import Path
+import time
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
 
 import numpy as np
 import pyarrow.parquet as pq
+import torch
 
-from brier_sim.runner import _SCHEMA, run_episodes
-from brier_sim.scenarios import scenarios
+from brier_sim import envs, storage
+from brier_sim.runner import _SCHEMA, _guide_episode, run_episodes
+from brier_sim.scenarios import build_scenarios, scenarios
 
 _ENVS = {
     "pusht": ("gym_pusht/PushT-v0", "lerobot/diffusion_pusht"),
@@ -165,6 +171,25 @@ def _validate(
             )
 
 
+def _upload_keyframes(parquet: Path, local: Path, remote_root: str) -> None:
+    directories = {(row["keyframes_uri"], row["tier"]) for row in pq.read_table(parquet).to_pylist()
+                   if row["keyframes_uri"] is not None}
+    for value, tier in sorted(directories):
+        relative = PurePosixPath(value)
+        if relative.is_absolute() or ".." in relative.parts or relative.parts[:2] != ("public", "keyframes"):
+            raise ValueError("keyframes_uri must be a relative directory under public/keyframes")
+        directory = (local / str(relative)).resolve()
+        if not directory.is_relative_to(local.resolve()) or not directory.is_dir():
+            raise ValueError("keyframes_uri directory is missing or outside BRIER_DATA")
+        frames = sorted(directory.glob("frame-*.png"))
+        expected = 1 if tier == "cheap" else 8
+        if tier not in ("cheap", "expensive") or len(frames) != expected or any(not frame.is_file() or not frame.resolve().is_relative_to(directory)
+                                   for frame in frames):
+            raise ValueError("cheap episodes require one PNG; failed expensive episodes require eight recorded PNG keyframes")
+        for frame in frames:
+            _copy(str(frame), f"{remote_root}/{relative}/{frame.name}")
+
+
 def run_shard(
     env: str, shard: int, shards: int, *, baseline: bool = False
 ) -> list[str]:
@@ -258,6 +283,7 @@ def run_shard(
                             _validate(result, change, scenario, tier)
                             result.replace(destination)
                             if remote:
+                                _upload_keyframes(destination, local, root)
                                 _copy(str(destination), uri)
                                 if not _existing(uri, destination):
                                     raise RuntimeError(
@@ -271,7 +297,120 @@ def run_shard(
     return completed
 
 
-if __name__ == "__main__":
+def _timing_json(payload: dict, uri: str) -> None:
+    destination = storage._location(uri)
+    parent = destination.parent if isinstance(destination, Path) else None
+    if parent is not None:
+        parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=parent) as directory:
+        source = Path(directory) / "timing.json"
+        source.write_text(json.dumps(payload, sort_keys=True, indent=2, allow_nan=False) + "\n")
+        storage._publish(source, uri)
+
+
+def _timing_root() -> str:
+    root = os.environ.get("BRIER_DATA", "").strip().rstrip("/")
+    if not root:
+        raise ValueError("BRIER_DATA is required for timing and sizing publication")
+    return root
+
+
+def _timing(env: str, out: str | None = None) -> dict:
+    if env not in ("pusht", "aloha"):
+        raise ValueError("timing env must be pusht or aloha")
+    host = socket.gethostname()
+    uri = out if out is not None else f"{_timing_root()}/timing/timing_{env}_{host}.json"
+    if out is not None and not isinstance(storage._location(out), Path):
+        raise ValueError("--out must be a local JSON file")
+    pins = hashlib.sha256(Path(__file__).with_name("pins.json").read_bytes()).hexdigest()
+    scenario = build_scenarios(env)[0]
+    torch.set_num_threads(1)
+    vector, policy = envs._load(env)
+    samples: dict[str, list[float]] = {"cheap": [], "expensive": []}
+    try:
+        for tier, values in samples.items():
+            for seed in scenario["seeds"][:3]:
+                started = time.perf_counter()
+                _guide_episode((vector, policy, None), env, scenario, tier, seed)
+                values.append(time.perf_counter() - started)
+    finally:
+        vector.close()
+    record = {"env": env, "host": host, "nproc": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count(),
+              "pins_sha256": pins, "github_actions": os.environ.get("GITHUB_ACTIONS") == "true",
+              "samples_seconds": samples, "median_seconds": {tier: float(np.median(values)) for tier, values in samples.items()}}
+    _timing_json(record, uri)
+    return record
+
+
+def _sizing() -> dict:
+    root = _timing_root()
+    location = storage._location(f"{root}/timing/")
+    if isinstance(location, Path):
+        records = [json.loads(path.read_text()) for path in sorted(location.glob("timing_*.json"))]
+    else:
+        blobs = storage._client().list_blobs(location[0], prefix=location[1].rstrip("/") + "/", retry=None)
+        records = [json.loads(blob.download_as_bytes(retry=None)) for blob in sorted(blobs, key=lambda item: item.name)
+                   if Path(blob.name).match("timing_*.json")]
+    pins = hashlib.sha256(Path(__file__).with_name("pins.json").read_bytes()).hexdigest()
+    measurements: dict[str, list[dict]] = {"pusht": [], "aloha": []}
+    for record in records:
+        if isinstance(record, dict) and record.get("github_actions") is False:
+            continue
+        if (not isinstance(record, dict) or record.get("github_actions") is not True or not isinstance(record.get("env"), str) or record["env"] not in measurements
+                or record.get("pins_sha256") != pins or not isinstance(record.get("host"), str) or not record["host"]
+                or type(record.get("nproc")) is not int or record["nproc"] < 1
+                or not isinstance(record.get("samples_seconds"), dict) or not isinstance(record.get("median_seconds"), dict)):
+            raise ValueError("invalid GitHub timing provenance or pins; re-time on GitHub Actions")
+        for tier in ("cheap", "expensive"):
+            values, median = record.get("samples_seconds", {}).get(tier), record.get("median_seconds", {}).get(tier)
+            if (not isinstance(values, list) or len(values) != 3
+                    or any(type(value) not in (int, float) or not 0 < value <= sys.float_info.max for value in values)
+                    or type(median) not in (int, float) or not 0 < median <= sys.float_info.max
+                    or not np.isclose(float(median), np.median(values), rtol=1e-12, atol=0)):
+                raise ValueError("timing requires three positive finite samples and their consistent median per tier")
+        measurements[record["env"]].append(record["median_seconds"])
+    if any(not values for values in measurements.values()):
+        raise ValueError("sizing requires actual GitHub Actions timing for both pusht and aloha")
+    medians = {env: {tier: float(np.median([sample[tier] for sample in samples])) for tier in ("cheap", "expensive")}
+               for env, samples in measurements.items()}
+    if medians["pusht"]["expensive"] > 30:
+        raise ValueError("PushT exceeds 30 s per expensive episode; adjust and record policy pins, then re-time all settings before sizing")
+    def projection(changes: int, scenarios: int) -> dict:
+        return {env: {"changes": changes, "scenarios": scenarios, "pairs": changes * scenarios, "median_seconds": times,
+                      "cpu_hours": (changes * scenarios * (3 * times["cheap"] + 20 * times["expensive"]) + 16 * 50 * times["expensive"]) / 3600}
+                for env, times in medians.items()}
+    def wall(environments: dict) -> float:
+        return round(sum(value["cpu_hours"] for value in environments.values()) / 80, 12)
+    target = wall(projection(80, 16))
+    changes, scenarios, notes = 80, 16, []
+    if target > 20:
+        changes, scenarios = 40, 12
+        notes.append("Minimum viable data selected: 40 changes at 35% benign can cover at most eight retained families four times; pilot must resolve coverage before generation.")
+    elif target > 10:
+        changes = next((count for count in range(76, 47, -4) if wall(projection(count, 16)) <= 10), 48)
+        if wall(projection(changes, 16)) > 10:
+            notes.append("The guide's 48-change floor exceeds 10 hours; the projection retains that floor explicitly.")
+    result = {"pins_sha256": pins, "capacity": {"github_actions_processes": 80, "spot_processes": 0, "total_processes": 80},
+              "environments": projection(changes, scenarios), "target_wall_hours": target,
+              "wall_hours": wall(projection(changes, scenarios)), "notes": notes}
+    _timing_json(result, f"{root}/manifests/sizing.json")
+    return result
+
+
+def _timing_cli(arguments: list[str]) -> bool:
+    if not arguments or arguments[0] not in ("timing", "sizing"):
+        return False
+    parser = argparse.ArgumentParser(prog=f"{__package__}.farm {arguments[0]}")
+    if arguments[0] == "timing":
+        parser.add_argument("--env", required=True, choices=("pusht", "aloha"))
+        parser.add_argument("--out")
+    args = parser.parse_args(arguments[1:])
+    result = _timing(args.env, args.out) if arguments[0] == "timing" else _sizing()
+    print(json.dumps(result["median_seconds"] if arguments[0] == "timing" else result, sort_keys=True))
+    return True
+
+
+if __name__ == "__main__" and not _timing_cli(sys.argv[1:]):
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", required=True, choices=_ENVS)
     parser.add_argument("--shard", required=True, type=int)
