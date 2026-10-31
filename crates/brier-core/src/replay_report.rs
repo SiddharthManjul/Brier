@@ -54,12 +54,25 @@ pub fn write_report(
         "at least one scored strategy is required"
     );
     let mut examples = BTreeMap::new();
+    let mut pairs_seen = BTreeSet::new();
     let mut splits = BTreeMap::new();
     for line in fs::read_to_string(compiled)?.lines() {
         let row: Value = serde_json::from_str(line)?;
         let id = row["id"].as_str().context("compiled id is missing")?;
-        let parts: Vec<_> = id.split('/').collect();
+        let guide = id.contains(':');
+        let parts: Vec<_> = id.split(if guide { ':' } else { '/' }).collect();
         ensure!(parts.len() == 4, "invalid compiled id");
+        if guide {
+            ensure!(
+                row["change_id"] == parts[0]
+                    && row["scenario_id"] == parts[1]
+                    && row["pair_id"] == format!("{}:{}", parts[0], parts[1])
+                    && row["question"] == parts[2]
+                    && row["variant"] == parts[3]
+                    && matches!(parts[3], "ev" | "noev"),
+                "invalid guide compiled identity"
+            );
+        }
         let split = row["split"].as_str().context("compiled split is missing")?;
         ensure!(
             matches!(split, "train" | "calibration" | "test" | "ood"),
@@ -68,7 +81,11 @@ pub fn write_report(
         if let Some(previous) = splits.insert(parts[0].to_owned(), split.to_owned()) {
             ensure!(previous == split, "change appears in multiple splits");
         }
-        if parts[2] == "regressed" && parts[3] == "cheap" {
+        if parts[2] == "regressed" && parts[3] == if guide { "ev" } else { "cheap" } {
+            ensure!(
+                pairs_seen.insert((parts[0].to_owned(), parts[1].to_owned())),
+                "duplicate compiled pair"
+            );
             ensure!(
                 examples
                     .insert(
