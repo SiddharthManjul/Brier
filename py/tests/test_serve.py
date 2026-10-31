@@ -81,6 +81,17 @@ def test_missing_logprob_fails_loudly() -> None:
         serving.score_options(generate, _Tokenizer(), _questions())
 
 
+def test_1536_token_prompt_matches_training_limit_and_reserves_one_answer() -> None:
+    questions = _questions()
+    for question in questions:
+        question["prompt"] = "x" * (1535 - len("<answer>")) + "<answer>"
+    assert len(_Tokenizer().encode(questions[0]["prompt"], add_special_tokens=True)) == 1536
+    assert len(serving.score_options(_generate, _Tokenizer(), questions)) == 3
+    questions[0]["prompt"] = "x" + questions[0]["prompt"]
+    with pytest.raises(ValueError, match="1536 tokens"):
+        serving.score_options(_generate, _Tokenizer(), questions)
+
+
 def test_multiple_tokens_and_context_mismatch_fail() -> None:
     class BadTokenizer(_Tokenizer):
         def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
@@ -199,6 +210,7 @@ def test_load_requests_raw_complete_option_scores_and_exact_token_ids(
     assert calls["engine"]["dtype"] == "bfloat16"
     assert calls["engine"]["language_model_only"] is True
     assert "quantization" not in calls["engine"]
+    assert calls["engine"]["max_model_len"] == 1537
     if with_adapter:
         assert calls["engine"]["enable_lora"] is True
         assert calls["engine"]["max_lora_rank"] == 16
