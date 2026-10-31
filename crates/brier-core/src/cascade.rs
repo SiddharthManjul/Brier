@@ -67,6 +67,89 @@ pub struct NumericState<'a> {
 }
 
 pub(crate) fn change_features(card: &Value) -> Result<Vec<f64>> {
+    let normalized;
+    let card = if card.get("desc").is_some() {
+        ensure!(
+            card.as_object().is_some_and(|o| o.len() == 5)
+                && ["change_id", "env", "families", "desc", "seed"]
+                    .iter()
+                    .all(|key| card.get(key).is_some())
+                && matches!(card["env"].as_str(), Some("pusht" | "aloha"))
+                && card["seed"].as_u64().is_some()
+                && card["change_id"]
+                    .as_str()
+                    .and_then(|id| id.strip_prefix('c'))
+                    .is_some_and(|id| id.len() >= 3
+                        && id.bytes().all(|b| b.is_ascii_digit())
+                        && id.bytes().any(|b| b != b'0')),
+            "invalid guide change card metadata"
+        );
+        let mut value =
+            serde_json::json!({"description": card["desc"], "families": card["families"]});
+        for entry in value["families"]
+            .as_array_mut()
+            .context("missing change families")?
+        {
+            let family = entry["family"]
+                .as_str()
+                .context("missing family name")?
+                .to_owned();
+            let params = entry["params"]
+                .as_object()
+                .context("missing change parameters")?;
+            ensure!(
+                params
+                    .iter()
+                    .all(|(key, value)| value.as_f64().is_some_and(|n| n.is_finite()
+                        && (!matches!(key.as_str(), "k" | "shift" | "n_action_steps")
+                            || value.as_u64().is_some())
+                        && (!matches!(key.as_str(), "sigma" | "gain" | "contrast" | "b")
+                            || n >= 0.0)
+                        && (!matches!(
+                            key.as_str(),
+                            "k" | "s" | "shift" | "n_action_steps" | "fraction"
+                        ) || n > 0.0)
+                        && (!matches!(key.as_str(), "p" | "fraction")
+                            || (0.0..=1.0).contains(&n)))),
+                "invalid guide change parameter bounds"
+            );
+            let number = |key: &str| -> Result<f64> {
+                params
+                    .get(key)
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite())
+                    .context("missing finite guide parameter")
+            };
+            entry["params"] = match family.as_str() {
+                "action_scale" | "action_bias" => {
+                    let key = if family == "action_scale" { "s" } else { "b" };
+                    let n = number(key)?;
+                    ensure!(params.len() == 1, "invalid guide scale or bias");
+                    if key == "s" {
+                        serde_json::json!({"scale":n})
+                    } else {
+                        serde_json::json!({"drift":n})
+                    }
+                }
+                "camera_shift" => {
+                    let shift = number("shift")?;
+                    ensure!(params.len() == 2, "invalid guide camera shift");
+                    serde_json::json!({"dx":shift,"dy":shift,"angle":number("angle")?})
+                }
+                "occlusion" => {
+                    let fraction = number("fraction")?;
+                    ensure!(params.len() == 1, "invalid guide occlusion");
+                    // Guide occlusion features encode normalized side lengths; location is seeded.
+                    serde_json::json!({"x":0.0,"y":0.0,"width":fraction,"height":fraction})
+                }
+                _ => entry["params"].clone(),
+            };
+        }
+        normalized = value;
+        &normalized
+    } else {
+        card
+    };
     let object = card.as_object().context("change card must be an object")?;
     ensure!(
         object.len() == 2 && object.contains_key("description"),
@@ -137,10 +220,21 @@ pub fn features(state: &NumericState<'_>) -> Result<Vec<f64>> {
         .params
         .as_object()
         .context("scenario params must be an object")?;
-    let pose = params
+    let mut pose = params
         .get("pose_bin")
         .and_then(Value::as_u64)
         .context("invalid pose_bin")?;
+    if state.card.get("desc").is_some() {
+        ensure!(
+            (1..=4).contains(&pose),
+            "guide pose_bin must be one through four"
+        );
+        ensure!(
+            state.card["env"] == if aloha { "aloha" } else { "pusht" },
+            "guide change/scenario environment mismatch"
+        );
+        pose -= 1;
+    }
     let lighting = params
         .get("lighting")
         .and_then(Value::as_str)
