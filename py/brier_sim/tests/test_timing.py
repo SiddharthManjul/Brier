@@ -218,10 +218,26 @@ def test_sizing_does_not_substitute_local_timing(tmp_path: Path, monkeypatch: py
         farm._sizing()
 
 
-def test_sizing_refuses_slow_pusht_before_cutting_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("steps,accepted", [(None, False), (100, False), (10, True), (2, True)])
+def test_sizing_requires_retimed_reduced_diffusion_before_cutting_data(
+    steps: int | None, accepted: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("BRIER_DATA", str(tmp_path))
+    pins = json.loads(Path(farm.__file__).with_name("pins.json").read_text())
+    pins["policies"]["pusht"].pop("num_inference_steps", None)
+    if steps is not None:
+        pins["policies"]["pusht"]["num_inference_steps"] = steps
+    code = tmp_path / "code"
+    code.mkdir()
+    (code / "pins.json").write_text(json.dumps(pins))
+    monkeypatch.setattr(farm, "__file__", str(code / "farm.py"))
     _write(tmp_path, _record("pusht", expensive=30.01), "pusht")
     _write(tmp_path, _record("aloha"), "aloha")
+    if accepted:
+        result = farm._sizing()
+        assert result["environments"]["pusht"]["median_seconds"]["expensive"] == 30.01
+        assert result["environments"]["pusht"]["changes"] == 80
+        return
     with pytest.raises(ValueError, match="adjust and record policy pins"):
         farm._sizing()
     assert not (tmp_path / "manifests/sizing.json").exists()
