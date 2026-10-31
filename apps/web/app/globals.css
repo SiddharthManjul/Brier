@@ -1,0 +1,87 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--foreground);
+  --color-popover: var(--card);
+  --color-popover-foreground: var(--foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--muted);
+  --color-secondary-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--muted);
+  --color-accent-foreground: var(--foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--border);
+  --color-ring: var(--primary);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+}
+
+:root {
+  color-scheme: light dark;
+  --background: #f7f7f2;
+  --foreground: #202822;
+  --card: #ffffff;
+  --muted: #ecefe8;
+  --muted-foreground: #59675c;
+  --border: #dce2d9;
+  --primary: #216344;
+  --primary-foreground: #ffffff;
+  --destructive: #ae3631;
+  --chart-1: #216344;
+  --chart-2: #aa6c1b;
+  --chart-3: #596ca2;
+  --chart-4: #af4e60;
+  --chart-5: #687847;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #151c17;
+    --foreground: #edf1e9;
+    --card: #1b241e;
+    --muted: #26332a;
+    --muted-foreground: #acb9ac;
+    --border: #344038;
+    --primary: #91c6a3;
+    --primary-foreground: #16271b;
+    --destructive: #f0988c;
+    --chart-1: #91c6a3;
+    --chart-2: #e5b778;
+    --chart-3: #a0b3ea;
+    --chart-4: #e9a6b4;
+    --chart-5: #b9c88c;
+  }
+}
+
+@layer base {
+  * { @apply border-border; }
+  body { @apply bg-background text-foreground; font-family: "Avenir Next", Avenir, "Segoe UI", sans-serif; }
+  h1 { @apply text-3xl font-semibold tracking-tight sm:text-4xl; }
+  h2 { @apply text-xl font-semibold tracking-tight; }
+  a, button, select { touch-action: manipulation; }
+  a:focus-visible { outline: 2px solid var(--primary); outline-offset: 4px; }
+  code, .font-mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+}
+
+@layer components {
+  .page { @apply mx-auto w-full max-w-7xl space-y-8 px-4 py-10 sm:px-8; }
+  .eyebrow { @apply text-xs font-semibold tracking-widest text-muted-foreground uppercase; }
+  .page-intro { @apply max-w-3xl space-y-3; }
+  .status-pass { @apply border-primary/25 bg-primary/10 text-primary; }
+  .status-block { @apply border-destructive/25 bg-destructive/10 text-destructive; }
+  .metric { @apply font-mono text-3xl font-medium tabular-nums tracking-tight; }
+}
