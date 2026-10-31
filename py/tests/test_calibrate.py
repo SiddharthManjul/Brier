@@ -24,8 +24,8 @@ def _records() -> list[dict]:
             probabilities = {key: 0.01 for key in choices}
             probabilities["A"] = 1 - 0.01 * (len(choices) - 1)
             rows.append({
-                "id": f"c{change:03}/pusht-s01/{question}/cheap",
-                "split": split, "question": question, "options": dict(choices),
+                "id": f"c{change:03}/pusht-s01/{question}/cheap", "split": split,
+                "question": question, "options": dict(choices),
                 "label": "A" if change <= 6 or split != "calibration" else "B",
                 "probabilities": probabilities,
             })
@@ -52,7 +52,6 @@ def test_fit_reports_calibration_metrics_without_mutating_labels() -> None:
         assert 1 < temperature <= 20
         metrics = report["calibration"][question]
         assert metrics["count"] == 8
-        assert set(metrics["before"]) == {"ece", "brier", "nll"}
         for key in ("ece", "brier", "nll"):
             assert metrics["after"][key] < metrics["before"][key]
     assert report["calibration"]["regressed"]["before"]["ece"] == pytest.approx(0.24)
@@ -70,8 +69,22 @@ def test_noncalibration_labels_and_scores_cannot_change_the_fit() -> None:
     assert fit_temperatures(records) == expected
 
 
-def test_calibration_is_invariant_to_shuffled_option_letters() -> None:
+@pytest.mark.parametrize(("label", "temperature"), [("A", 0.05), ("B", 20.0)])
+def test_temperature_fit_respects_both_search_bounds(label: str, temperature: float) -> None:
     records = _records()
+    for record in records:
+        if record["split"] == "calibration":
+            record["label"] = label
+    report = fit_temperatures(records)
+    assert all(value == temperature for value in report["temperatures"].values())
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_calibration_is_invariant_to_shuffled_option_letters(tied: bool) -> None:
+    records = _records()
+    if tied:
+        for record in records:
+            record["probabilities"] = dict.fromkeys(record["options"], 1 / len(record["options"]))
     expected = fit_temperatures(records)
     for record in records:
         letters = sorted(record["options"])
@@ -80,13 +93,7 @@ def test_calibration_is_invariant_to_shuffled_option_letters() -> None:
         scores = {renamed[key]: value for key, value in record["probabilities"].items()}
         record["probabilities"] = {key: scores[key] for key in letters}
         record["label"] = renamed[record["label"]]
-    actual = fit_temperatures(records)
-    assert actual["temperatures"] == pytest.approx(expected["temperatures"], rel=1e-6)
-    for question in expected["calibration"]:
-        for stage in ("before", "after"):
-            assert actual["calibration"][question][stage] == pytest.approx(
-                expected["calibration"][question][stage], abs=1e-9
-            )
+    assert fit_temperatures(records) == expected
 
 
 @pytest.mark.parametrize("temperature", [0, -1, math.nan, math.inf, True])
@@ -96,8 +103,8 @@ def test_apply_temperature_rejects_invalid_temperature(temperature: float) -> No
 
 
 @pytest.mark.parametrize("probabilities", [
-    {"A": 0.0, "B": 1.0}, {"A": math.nan, "B": 0.2},
-    {"A": math.inf, "B": 0.2}, {"A": 0.8, "B": 0.3}, {"A": True, "B": 0.2},
+    {"A": 0.0, "B": 1.0}, {"A": math.nan, "B": 0.2}, {"A": math.inf, "B": 0.2},
+    {"A": 0.8, "B": 0.3}, {"A": True, "B": 0.2},
 ])
 def test_apply_temperature_rejects_invalid_scores(probabilities: dict) -> None:
     with pytest.raises(ValueError, match="probabilit"):
@@ -114,8 +121,9 @@ def test_fit_rejects_altered_option_semantics(question: str) -> None:
 
 
 @pytest.mark.parametrize(("field", "value"), [
-    ("label", "Z"), ("split", "validation"),
-    ("probabilities", {"A": 0.5, "C": 0.5}), ("question", "failure_mode"),
+    ("label", "Z"), ("split", "validation"), ("probabilities", {"A": 0.5, "C": 0.5}),
+    ("question", "failure_mode"), ("id", "c000/pusht-s01/regressed/cheap"),
+    ("id", "c103/pusht-s00/regressed/cheap"),
 ])
 def test_fit_validates_excluded_rows(field: str, value: object) -> None:
     records = _records()
@@ -137,7 +145,7 @@ def test_fit_rejects_duplicate_rows_and_split_overlap(duplicate: bool) -> None:
 
 
 def test_fit_requires_calibration_examples_for_every_question() -> None:
-    records = [row for row in _records()
-               if row["question"] != "success_bucket" or row["split"] != "calibration"]
+    records = [row for row in _records() if row["question"] != "success_bucket"
+               or row["split"] != "calibration"]
     with pytest.raises(ValueError, match="all three"):
         fit_temperatures(records)
