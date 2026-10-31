@@ -7,19 +7,19 @@ import sys
 import numpy as np
 import pytest
 from brier_ml.calibrate import apply, fit_temperatures, metrics
-from brier_ml.glimmer_data import _OPTIONS
+from brier_ml.glimmer_data import _OPTIONS, calibration_partition
 
 
 def _row(question="regressed", index=1, *, split="calibration", variant="ev",
-         logits=None, options=None, label="A"):
+         logits=None, options=None, label="A", scenario=1):
     choices = list(options or _OPTIONS[question])
     values = list(logits or ([.8, .2] + [1000.] * 4 if question == "regressed"
                              else [float(i) for i in range(6)]))
     valid = np.asarray(values[:len(choices)], dtype=float)
     p = np.exp(valid - valid.max())
     p /= p.sum()
-    return {"id": f"c{index:03}:pusht-s01:{question}:{variant}",
-            "pair_id": f"c{index:03}:pusht-s01", "split": split,
+    return {"id": f"c{index:03}:pusht-s{scenario:02}:{question}:{variant}",
+            "pair_id": f"c{index:03}:pusht-s{scenario:02}", "split": split,
             "question": question, "variant": variant, "options": choices, "label": label,
             "logits": values, "probs": dict(zip("ABCDEF"[:len(choices)], p.tolist(), strict=True)),
             "model": "glimmer-base-zeroshot", "revision": "a" * 40}
@@ -38,10 +38,10 @@ def _synthetic(temperature=2.7):
     for question, probabilities in distributions.items():
         logits = [temperature * math.log(p) for p in probabilities]
         logits += [1000.] * (6 - len(logits))
-        labels = [letter for letter, p in zip("ABCDEF", probabilities) for _ in range(round(100 * p))]
-        for variant in ("ev", "noev"):
-            rows.extend(_row(question, i + 1, label=label, variant=variant, logits=logits)
-                        for i, label in enumerate(labels))
+        labels = [letter for letter, p in zip("ABCDEF", probabilities) for _ in range(round(20 * p))]
+        for change in range(1, 25):
+            rows.extend(_row(question, change, label=label, variant="ev" if i % 2 else "noev",
+                             scenario=i // 2 + 1, logits=logits) for i, label in enumerate(labels))
     return rows
 
 
@@ -57,10 +57,46 @@ def test_known_temperature_recovered_from_raw_logits_with_valid_mask(tmp_path):
     assert fit_temperatures(str(path)) == found
 
 
+def test_reserved_risk_labels_cannot_change_fitted_temperatures(tmp_path):
+    rows = _synthetic()
+    fit, risk = calibration_partition([row["pair_id"].split(":")[0] for row in rows])
+    path = _write(tmp_path / "probs/calibration.jsonl", rows)
+    expected = fit_temperatures(path)
+    altered = 0
+    for row in rows:
+        if row["pair_id"].split(":")[0] in risk:
+            row["label"] = "ABCDEF"[("ABCDEF".index(row["label"]) + 1) % len(row["options"])]
+            altered += 1
+    assert altered == 19 * 20 * 3 and len(fit) == 5
+    assert fit_temperatures(_write(path, rows)) == expected
+
+
+def test_temperature_fitting_refuses_too_few_changes_for_independent_risk(tmp_path):
+    rows = [_row(q, change) for q in _OPTIONS for change in range(1, 20)]
+    with pytest.raises(ValueError, match="20"):
+        fit_temperatures(_write(tmp_path / "probs/calibration.jsonl", rows))
+
+
+@pytest.mark.parametrize("metadata_name", ["meta.json", "run_meta.json"])
+def test_fitting_matches_training_partition_metadata_before_writing(tmp_path, metadata_name):
+    rows = _synthetic()
+    fit, risk = calibration_partition([row["pair_id"].split(":")[0] for row in rows])
+    partition = {"fit_change_ids": fit, "risk_change_ids": risk}
+    path = _write(tmp_path / "probs/calibration.jsonl", rows)
+    meta_path = tmp_path / metadata_name
+    meta_path.write_text(json.dumps({"calibration_partition": partition}))
+    assert list(fit_temperatures(path).values()) == pytest.approx([2.7] * 3, rel=.05)
+    partition["fit_change_ids"], partition["risk_change_ids"] = risk, fit
+    meta_path.write_text(json.dumps({"calibration_partition": partition}))
+    with pytest.raises(ValueError, match="calibration_partition disagrees"):
+        fit_temperatures(path)
+    assert not (tmp_path / "probs_temp").exists() and not (tmp_path / "temps.json").exists()
+
+
 def test_fit_cannot_consume_heldout_or_previously_scaled_rows(tmp_path):
     rows = _synthetic()
     for split in ("test", "ood", "train"):
-        heldout = dict(rows[0], split=split, id="c801:pusht-s01:regressed:ev", pair_id="c801:pusht-s01")
+        heldout = dict(rows[0], split=split, variant="ev", id="c801:pusht-s01:regressed:ev", pair_id="c801:pusht-s01")
         with pytest.raises(ValueError, match="only unscaled calibration"):
             fit_temperatures(_write(tmp_path / "input.jsonl", rows + [heldout]))
     rows[0]["temperature"] = 1.
@@ -70,7 +106,8 @@ def test_fit_cannot_consume_heldout_or_previously_scaled_rows(tmp_path):
 
 @pytest.mark.parametrize(("label", "expected"), [("A", .05), ("B", 20.)])
 def test_known_boundary_optima_are_preserved(tmp_path, label, expected):
-    rows = [_row(question, logits=[5., 0., 0., 0., 0., 0.], label=label) for question in _OPTIONS]
+    rows = [_row(question, change, logits=[5., 0., 0., 0., 0., 0.], label=label)
+            for question in _OPTIONS for change in range(1, 21)]
     found = fit_temperatures(_write(tmp_path / "calibration.jsonl", rows))
     assert list(found.values()) == pytest.approx([expected] * 3)
 
@@ -169,13 +206,19 @@ def test_cli_fits_only_calibration_preserves_source_and_writes_expected_artifact
     temperatures = json.loads((model_dir / "temps.json").read_text())
     assert list(temperatures.values()) == pytest.approx([2.7] * 3, rel=.05)
     report = json.loads((model_dir / "metrics.json").read_text())
-    assert set(report) == {"model", "revision", "temperatures", "splits"}
+    assert set(report) == {"model", "revision", "temperatures", "splits", "calibration_partition"}
     assert report["model"] == "glimmer-base-zeroshot" and report["revision"] == "a" * 40
     assert report["temperatures"] == temperatures and set(report["splits"]) == {"test", "ood"}
+    fit, risk = calibration_partition([row["pair_id"].split(":")[0] for row in rows])
+    assert report["calibration_partition"] == {"fit_change_ids": fit, "risk_change_ids": risk}
+    assert len(risk) == 19 and not set(fit) & set(risk)
     for split in ("calibration", "test", "ood"):
         path = model_dir / f"probs_temp/{split}.jsonl"
         actual = [json.loads(line) for line in path.read_text().splitlines()]
         assert all(row["temperature"] == temperatures[row["question"]] for row in actual)
+        if split == "calibration":
+            assert {row["id"] for row in actual} == {row["id"] for row in rows}
+            assert {row["pair_id"].split(":")[0] for row in actual} >= set(risk)
         if split != "calibration":
             assert report["splits"][split]["before"] == metrics(model_dir / f"probs/{split}.jsonl")
             assert report["splits"][split]["after"] == metrics(path)
