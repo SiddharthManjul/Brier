@@ -1,0 +1,11 @@
+# Set revision to the actual immutable checkpoint commit before running Robot CI.
+env: gym_pusht/PushT-v0
+policy:
+  id: lerobot/diffusion_pusht
+  revision: null
+description: Unchanged policy checkpoint
+families:
+  - family: benign
+    params: {}
+logging:
+  level: info
