@@ -10,7 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-from brier_ml.finetune import load_training_data
+from brier_ml.dataset import _compiled_rows
 
 
 def score_compiled(compiled: Path, output: Path) -> dict[str, object]:
@@ -31,13 +31,14 @@ def score_compiled(compiled: Path, output: Path) -> dict[str, object]:
         or address.path != "/decide"
     ):
         raise ValueError("MODAL_DECIDE_URL must be the full HTTP(S) /decide endpoint")
-    load_training_data(compiled)
+    rows = _compiled_rows(compiled)
     source = compiled.read_bytes()
     groups: dict[tuple[str, str, str], list[dict[str, object]]] = {}
-    for line in source.splitlines():
-        row = json.loads(line)
-        change, scenario, _, evidence = row["id"].split("/")
-        groups.setdefault((change, scenario, evidence), []).append(
+    for row in rows:
+        if (not row["prompt"].startswith("<system> ") or not row["prompt"].endswith("<answer>")
+                or any(marker not in row["prompt"] for marker in ("\n<state>\n", "\n<question> ", "\n<options> "))):
+            raise ValueError("invalid compiled prompt")
+        groups.setdefault((row["change"], row["scenario"], row["evidence"]), []).append(
             {key: row[key] for key in ("id", "prompt", "options")}
         )
     if any(len(rows) != 3 for rows in groups.values()):
