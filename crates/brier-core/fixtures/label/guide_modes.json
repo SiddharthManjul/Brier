@@ -1,0 +1,14 @@
+[
+  {"name":"aloha_success","env":"aloha","wins":20,"metrics":{},"expected":"none"},
+  {"name":"aloha_oscillation_first","env":"aloha","wins":0,"metrics":{"action_flip_rate":0.36,"table_contact_steps":20,"max_reward":3.0,"final_reward":1.0},"expected":"oscillation"},
+  {"name":"aloha_collision_boundary","env":"aloha","wins":0,"metrics":{"action_flip_rate":0.35,"table_contact_steps":20},"expected":"collision"},
+  {"name":"aloha_lift_then_drop","env":"aloha","wins":0,"metrics":{"max_reward":2.0,"final_reward":1.0},"expected":"grasp or drop failure"},
+  {"name":"aloha_touch_only","env":"aloha","wins":0,"metrics":{"max_reward":1.0,"final_reward":1.0},"expected":"grasp or drop failure"},
+  {"name":"aloha_misalignment","env":"aloha","wins":0,"metrics":{"max_reward":3.0,"final_reward":2.0},"expected":"overshoot/misalignment"},
+  {"name":"aloha_timeout","env":"aloha","wins":0,"metrics":{"table_contact_steps":19,"action_flip_rate":0.35},"expected":"stall/timeout"},
+  {"name":"pusht_success","env":"pusht","wins":20,"metrics":{},"expected":"none"},
+  {"name":"pusht_oscillation_first","env":"pusht","wins":0,"metrics":{"action_flip_rate":0.36,"coverage_max":0.8,"block_disp_px":1.0},"expected":"oscillation"},
+  {"name":"pusht_coverage_boundary","env":"pusht","wins":0,"metrics":{"coverage_max":0.5,"block_disp_px":1.0},"expected":"overshoot/misalignment"},
+  {"name":"pusht_stall","env":"pusht","wins":0,"metrics":{"coverage_max":0.49,"block_disp_px":19.99},"expected":"stall/timeout"},
+  {"name":"pusht_displacement_boundary","env":"pusht","wins":0,"metrics":{"coverage_max":0.49,"block_disp_px":20.0},"expected":"overshoot/misalignment"}
+]
