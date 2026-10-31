@@ -376,12 +376,15 @@ def _guide_train(cfg: dict[str, Any]) -> dict[str, Any]:
     path = Path(_required("BRIER_DATA")) / "compiled.jsonl"
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     revision = (Path(BASE_DIR) / "revision.txt").read_text().strip()
+    rows = gd.load_examples(path, ["train", "calibration"])
+    fit_ids, risk_ids = gd.calibration_partition(r["change_id"] for r in rows if r["split"] == "calibration")
+    partition = {"fit_change_ids": fit_ids, "risk_change_ids": risk_ids}
     model, tokenizer, info = gm.load_base(BASE_DIR, revision, cfg["quant"])
     model = gm.add_lora(model)
-    rows = gd.load_examples(path, ["train", "calibration"])
     train_rows = gd.tokenize([r for r in rows if r["split"] == "train"], tokenizer)
     evaluation = sorted((r for r in rows if r["split"] == "calibration"
-                         and r["question"] == "regressed" and r["variant"] == "ev"), key=lambda r: r["id"])[:256]
+                         and r["change_id"] in fit_ids and r["question"] == "regressed"
+                         and r["variant"] == "ev"), key=lambda r: r["id"])[:256]
     eval_rows = gd.tokenize(evaluation, tokenizer)
     letters, pad = gd.letter_token_ids(tokenizer), train_rows[0]["pad_id"]
     device = next(model.parameters()).device
@@ -414,8 +417,9 @@ def _guide_train(cfg: dict[str, Any]) -> dict[str, Any]:
     if checkpoints:
         checkpoint = checkpoints[-1]
         state = json.loads((checkpoint / "state.json").read_text())
-        if state["config"] != cfg or state["data_hash"] != digest or state["revision"] != revision:
-            raise ValueError("checkpoint configuration, dataset hash or base revision differs")
+        if (state["config"] != cfg or state["data_hash"] != digest or state["revision"] != revision
+                or state.get("calibration_partition") != partition):
+            raise ValueError("checkpoint configuration, dataset hash, base revision or calibration partition differs")
         step, epoch, cursor = (state[k] for k in ("step", "epoch", "cursor"))
         accum = cfg["effective_batch"] // cfg["micro_batch"]
         if (any(type(n) is not int or n < 0 for n in (step, epoch, cursor)) or step > total
@@ -488,7 +492,7 @@ def _guide_train(cfg: dict[str, Any]) -> dict[str, Any]:
                "cuda": [s.tolist() for s in torch.cuda.get_rng_state_all()] if device.type == "cuda" else []}
         state = {"step": step, "epoch": epoch, "cursor": cursor, "rng": rng, "config": cfg, "data_hash": digest,
                      "revision": revision, "seconds": seconds(), "tokens": tokens, "examples": examples,
-                     "best_eval_nll": best, "best_step": best_step, "eval": last_eval}
+                     "best_eval_nll": best, "best_step": best_step, "eval": last_eval, "calibration_partition": partition}
         (temporary / "state.json").write_text(json.dumps(state, allow_nan=False) + "\n")
         if dest.exists():
             shutil.rmtree(dest)
@@ -560,6 +564,7 @@ def _guide_train(cfg: dict[str, Any]) -> dict[str, Any]:
                              "dataset_digest": digest, "recipe": cfg}, "step": step}, allow_nan=False) + "\n")
     manifest_temp.replace(manifest)
     meta = dict(info, base_repo=BASE_REPO, revision=revision, config=cfg, steps=step, epochs=epoch + 1,
+                calibration_partition=partition,
                 data_sha256=digest, letter_token_ids=letters, pad_id=pad, pad_source=train_rows[0]["pad_source"],
                 lora_config={k: v.to_dict() for k, v in model.peft_config.items()},
                 target_names=sorted(n for n, module in model.named_modules() if hasattr(module, "lora_A")), final_eval_nll=last_eval["nll"],
