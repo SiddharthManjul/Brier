@@ -1,0 +1,13 @@
+{
+  "lerobot_version": "0.3.3",
+  "policies": {
+    "pusht": {
+      "repo_id": "lerobot/diffusion_pusht",
+      "revision": "84a7c23178445c6bbf7e1a884ff497017910f653"
+    },
+    "aloha": {
+      "repo_id": "lerobot/act_aloha_sim_transfer_cube_human",
+      "revision": "ba73b2766f1371cdc133ca4efb97eb090d744625"
+    }
+  }
+}
