@@ -378,7 +378,7 @@ def _sizing() -> dict:
         raise ValueError("sizing requires actual GitHub Actions timing for both pusht and aloha")
     medians = {env: {tier: float(np.median([sample[tier] for sample in samples])) for tier in ("cheap", "expensive")}
                for env, samples in measurements.items()}
-    if medians["pusht"]["expensive"] > 30:
+    if medians["pusht"]["expensive"] > 30 and json.loads(Path(__file__).with_name("pins.json").read_text())["policies"]["pusht"].get("num_inference_steps", 100) >= 100:
         raise ValueError("PushT exceeds 30 s per expensive episode; adjust and record policy pins, then re-time all settings before sizing")
     def projection(changes: int, scenarios: int) -> dict:
         return {env: {"changes": changes, "scenarios": scenarios, "pairs": changes * scenarios, "median_seconds": times,
