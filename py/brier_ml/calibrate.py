@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
 import re
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -95,12 +97,14 @@ def _metrics(question: str, samples: list[_Sample], temperature: float) -> dict[
     return {"ece": ece, "brier": brier, "nll": _loss(samples, temperature)}
 
 
-def fit_temperatures(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Fit one temperature per question on calibration rows within [0.05, 20].
+def fit_temperatures(records: list[dict[str, Any]] | Path | str) -> dict[str, Any]:
+    """Fit temperatures from M6 calibration JSONL or return the legacy list report.
 
     Scored compiled rows require id, split, question, options, label, probabilities.
     Returned metrics describe calibration rows only; multiclass Brier sums options.
     """
+    if isinstance(records, (str, Path)):
+        return _fit_scores(_score_rows(records))
     if not isinstance(records, list) or not records:
         raise ValueError("records must be a nonempty list of scored compiled rows")
     required = {"id", "split", "question", "options", "label", "probabilities"}
@@ -176,3 +180,162 @@ def fit_temperatures(records: list[dict[str, Any]]) -> dict[str, Any]:
             "after": _metrics(question, samples, temperature),
         }
     return {"temperatures": temperatures, "calibration": reports}
+
+
+def _score_rows(path: Path | str) -> list[dict]:
+    from brier_ml.glimmer_data import _OPTIONS
+
+    rows, seen, changes, sources = [], set(), {}, set()
+    fields = {"id", "pair_id", "split", "question", "variant", "options", "label",
+              "logits", "probs", "model", "revision"}
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        row = json.loads(line)
+        if not isinstance(row, dict) or set(row) not in (fields, fields | {"temperature"}):
+            raise ValueError("scores must contain exactly the M6 fields and optional temperature")
+        match = re.fullmatch(r"(c[0-9]{3,}):((?:pusht|aloha)-s(?:0[1-9]|1[0-6])):"
+                             r"(regressed|failure_mode|success_bucket):(ev|noev)", str(row["id"]))
+        if (match is None or int(match[1][1:]) == 0 or row["id"] in seen
+                or row["pair_id"] != f"{match[1]}:{match[2]}"
+                or row["question"] != match[3] or row["variant"] != match[4]
+                or not isinstance(row["split"], str) or row["split"] not in _SPLITS):
+            raise ValueError("invalid, inconsistent or duplicate score identity/split")
+        question, choices = row["question"], row["options"]
+        if (not isinstance(choices, list) or any(not isinstance(v, str) for v in choices)
+                or len(choices) != len(_OPTIONS[question]) or set(choices) != set(_OPTIONS[question])
+                or not isinstance(row["label"], str) or len(row["label"]) != 1
+                or row["label"] not in "ABCDEF"[:len(choices)]):
+            raise ValueError("invalid score option semantics or label")
+        values, probs = row["logits"], row["probs"]
+        if (not isinstance(values, list) or len(values) != 6
+                or any(type(v) not in (float, int) or not math.isfinite(v) for v in values)
+                or not isinstance(probs, dict) or set(probs) != set("ABCDEF"[:len(choices)])
+                or any(type(v) not in (float, int) or not 0 <= v <= 1 for v in probs.values())
+                or not math.isclose(math.fsum(probs.values()), 1, abs_tol=1e-6)):
+            raise ValueError("scores require six finite logits and normalized valid-option probs")
+        if (not isinstance(row["model"], str) or not row["model"]
+                or not isinstance(row["revision"], str)
+                or re.fullmatch(r"[0-9a-f]{40}", row["revision"]) is None
+                or (match[1] in changes and changes[match[1]] != row["split"])):
+            raise ValueError("scores require model/revision provenance and change-disjoint splits")
+        if "temperature" in row and (type(row["temperature"]) not in (int, float)
+                                      or not 0.05 <= row["temperature"] <= 20):
+            raise ValueError("score temperature must be in [0.05, 20]")
+        seen.add(row["id"])
+        changes[match[1]] = row["split"]
+        sources.add((row["model"], row["revision"]))
+        rows.append(row)
+    if not rows or len(sources) != 1:
+        raise ValueError("score file must be nonempty and have one model/revision")
+    return rows
+
+
+def _fit_scores(rows: list[dict]) -> dict[str, float]:
+    from scipy.optimize import minimize_scalar
+    from scipy.special import logsumexp
+
+    from brier_ml.glimmer_data import _OPTIONS
+
+    if any(row["split"] != "calibration" or "temperature" in row for row in rows):
+        raise ValueError("temperature fitting requires only unscaled calibration scores")
+    result = {}
+    for question, options in _OPTIONS.items():
+        selected = [row for row in rows if row["question"] == question]
+        if not selected:
+            raise ValueError("calibration rows are required for all three question types")
+        logits = np.asarray([row["logits"][:len(options)] for row in selected], dtype=float)
+        labels = np.asarray(["ABCDEF".index(row["label"]) for row in selected])
+
+        def loss(log_t: float, logits: np.ndarray = logits, labels: np.ndarray = labels) -> float:
+            z = logits / math.exp(log_t)
+            return float((logsumexp(z, axis=1) - z[np.arange(len(labels)), labels]).mean())
+
+        fit = minimize_scalar(loss, bounds=(math.log(.05), math.log(20)), method="bounded")
+        if not fit.success or not math.isfinite(fit.fun):
+            raise ValueError(f"temperature optimization failed for {question}")
+        result[question] = math.exp(min((0.0, math.log(.05), math.log(20), fit.x), key=loss))
+    return result
+
+
+def apply(probs_jsonl: Path | str, temps: dict[str, float]) -> Path:
+    """Recompute valid-option probabilities from raw logits into sibling probs_temp."""
+    from scipy.special import softmax
+
+    from brier_ml.glimmer_data import _OPTIONS
+
+    if (set(temps) != set(_OPTIONS) or any(type(t) not in (int, float)
+                                          or not .05 <= t <= 20 for t in temps.values())):
+        raise ValueError("temperatures must name all three questions with values in [0.05, 20]")
+    rows = _score_rows(probs_jsonl)
+    for row in rows:
+        t, k = temps[row["question"]], len(row["options"])
+        p = softmax(np.asarray(row["logits"][:k], dtype=float) / t)
+        row.update(probs=dict(zip("ABCDEF"[:k], p.tolist(), strict=True)), temperature=t)
+    destination = Path(probs_jsonl).parent.parent / "probs_temp" / Path(probs_jsonl).name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("".join(json.dumps(row, allow_nan=False) + "\n" for row in rows), encoding="utf-8")
+    return destination
+
+
+def metrics(probs_jsonl: Path | str) -> dict:
+    """Report pooled and ev/noev metrics, mapping shuffled options by their semantics."""
+    from brier_ml import losses
+    from brier_ml.glimmer_data import _OPTIONS
+
+    rows, result = _score_rows(probs_jsonl), {}
+    for question, options in _OPTIONS.items():
+        variants = {}
+        for variant in ("ev", "noev", "both"):
+            selected = [row for row in rows if row["question"] == question
+                        and (variant == "both" or row["variant"] == variant)]
+            if not selected:
+                variants[variant] = {"count": 0}
+                continue
+            p = np.asarray([[row["probs"]["ABCDEF"[row["options"].index(option)]]
+                             for option in options] for row in selected])
+            y = np.asarray([options.index(row["options"]["ABCDEF".index(row["label"])]) for row in selected])
+            values = {"count": len(selected), "nll": losses.nll(p, y),
+                      "brier": losses.brier(p, y), "accuracy": losses.accuracy(p, y)}
+            if question == "regressed":
+                yes = options.index("yes")
+                values.update(ece=losses.ece_equal_mass(p[:, yes], y == yes),
+                              auroc=losses.auroc(p[:, yes], y == yes))
+            elif question == "success_bucket":
+                values["rps"] = losses.rps(p, y)
+            variants[variant] = values
+        result[question] = {**variants["both"], "variants": variants}
+    return result
+
+
+def _main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument("--name", required=True)
+    args = parser.parse_args()
+    paths = {split: args.model_dir / "probs" / f"{split}.jsonl"
+             for split in ("calibration", "test", "ood")}
+    datasets = {split: _score_rows(path) for split, path in paths.items()}
+    all_rows = [row for rows in datasets.values() for row in rows]
+    if any(any(row["split"] != split for row in rows) for split, rows in datasets.items()):
+        raise ValueError("each probability filename must match every row's split")
+    changes = {}
+    for row in all_rows:
+        changes.setdefault(row["pair_id"].split(":")[0], set()).add(row["split"])
+    source = all_rows[0]
+    if (source["model"] not in (args.name, "glimmer-ft-" + args.name)
+            or len({(row["model"], row["revision"]) for row in all_rows}) != 1
+            or any(len(splits) != 1 for splits in changes.values())):
+        raise ValueError("all scoring splits must share provenance and have disjoint changes")
+    temps = fit_temperatures(paths["calibration"])
+    report = {"model": source["model"], "revision": source["revision"], "temperatures": temps, "splits": {}}
+    for split, path in paths.items():
+        scaled = apply(path, temps)
+        if split != "calibration":
+            report["splits"][split] = {"before": metrics(path), "after": metrics(scaled)}
+    (args.model_dir / "temps.json").write_text(json.dumps(temps, allow_nan=False) + "\n", encoding="utf-8")
+    (args.model_dir / "metrics.json").write_text(json.dumps(report, allow_nan=False) + "\n", encoding="utf-8")
+
+
+if __name__ == "__main__":
+    _main()
