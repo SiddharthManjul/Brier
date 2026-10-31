@@ -3,7 +3,7 @@ use std::{env, fs, path::PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-mod compile;
+use brier_core::compile;
 mod label;
 
 #[derive(Parser)]
@@ -29,6 +29,58 @@ enum Command {
         #[arg(long)]
         catalog: PathBuf,
     },
+    Card {
+        #[arg(long)]
+        before: PathBuf,
+        #[arg(long)]
+        after: PathBuf,
+        #[arg(long)]
+        change: String,
+    },
+    Decide {
+        #[arg(long)]
+        ledger: PathBuf,
+        #[arg(long)]
+        compiled: PathBuf,
+        #[arg(long)]
+        calibration: PathBuf,
+        #[arg(long)]
+        change: String,
+        #[arg(long, default_value_t = brier_core::policy::DEFAULT_ALPHA)]
+        alpha: f64,
+    },
+    Replay {
+        #[arg(long)]
+        ledger: PathBuf,
+        #[arg(long)]
+        compiled: PathBuf,
+        #[arg(long)]
+        scores: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = brier_core::policy::DEFAULT_ALPHA)]
+        alpha: f64,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    Report {
+        #[arg(long)]
+        ledger: PathBuf,
+        #[arg(long)]
+        change: String,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        push: Option<String>,
+        #[arg(long)]
+        metrics: Option<PathBuf>,
+    },
+    Explain {
+        #[arg(long)]
+        ledger: PathBuf,
+        #[arg(long)]
+        run: String,
+    },
     Ledger {
         #[command(subcommand)]
         command: LedgerCommand,
@@ -48,6 +100,60 @@ fn main() -> Result<()> {
             episodes,
             catalog,
         } => label::label(&ledger, &episodes, &catalog)?,
+        Command::Card {
+            before,
+            after,
+            change,
+        } => {
+            let card = brier_core::card::card(&before, &after, &change)?;
+            println!("{}", serde_json::to_string(&card)?);
+        }
+        Command::Decide {
+            ledger,
+            compiled,
+            calibration,
+            change,
+            alpha,
+        } => {
+            let report =
+                brier_core::decide::decide(&ledger, &compiled, &calibration, &change, alpha)?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Command::Replay {
+            ledger,
+            compiled,
+            scores,
+            out,
+            alpha,
+            seed,
+        } => {
+            brier_core::replay_report::write_report(
+                &ledger, &compiled, &scores, &out, alpha, seed,
+            )?;
+        }
+        Command::Report {
+            ledger,
+            change,
+            out,
+            push,
+            metrics,
+        } => {
+            let report = brier_core::report::report(
+                &ledger,
+                &change,
+                &out,
+                push.as_deref(),
+                metrics.as_deref(),
+            )?;
+            println!("{}", serde_json::to_string(&report)?);
+            if report.verdict != "pass" {
+                bail!("Brier: {}", report.verdict.to_uppercase());
+            }
+        }
+        Command::Explain { ledger, run } => {
+            let report = brier_core::explain::explain(&ledger, &run)?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
         Command::Ledger {
             command: LedgerCommand::Init,
         } => {
