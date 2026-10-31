@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -12,7 +13,7 @@ use parquet::{
     record::RowAccessor,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -45,6 +46,8 @@ struct Scenario {
     env: String,
     params: Value,
     seeds: Vec<i64>,
+    #[serde(default)]
+    baseline_success: Option<f64>,
 }
 #[derive(Default)]
 struct Run {
@@ -517,6 +520,333 @@ pub fn label(ledger_path: &Path, episodes: &Path, catalog_path: &Path) -> Result
     transaction
         .commit()
         .context("commit labeled episode import")
+}
+
+#[derive(Deserialize)]
+struct GuideEpisode {
+    env: String,
+    change_id: String,
+    scenario_id: String,
+    tier: String,
+    episode_idx: usize,
+    seed: i64,
+    success: bool,
+    steps: i64,
+    max_steps: i64,
+    reward_sum: f64,
+    wall_seconds: f64,
+    action_flip_rate: f64,
+    max_reward: f64,
+    final_reward: f64,
+    coverage_max: Option<f64>,
+    block_disp_px: Option<f64>,
+    table_contact_steps: Option<i64>,
+}
+
+fn jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+    let rows = BufReader::new(File::open(path)?)
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            serde_json::from_str(&line?)
+                .with_context(|| format!("{} line {}", path.display(), index + 1))
+        })
+        .collect::<Result<Vec<T>>>()?;
+    ensure!(!rows.is_empty(), "empty JSONL {}", path.display());
+    Ok(rows)
+}
+
+fn guide_env(env: &str) -> Result<&'static str> {
+    match env {
+        "pusht" => Ok("gym_pusht/PushT-v0"),
+        "aloha" => Ok("gym_aloha/AlohaTransferCube-v0"),
+        _ => bail!("unsupported guide environment {env}"),
+    }
+}
+
+fn guide_mode(row: &GuideEpisode) -> Result<usize> {
+    ensure!(
+        row.steps > 0
+            && row.steps <= row.max_steps
+            && row.reward_sum.is_finite()
+            && row.wall_seconds.is_finite()
+            && row.wall_seconds >= 0.0
+            && (0.0..=1.0).contains(&row.action_flip_rate)
+            && row.final_reward >= 0.0
+            && row.final_reward <= row.max_reward
+            && row.max_reward <= if row.env == "pusht" { 1.0 } else { 4.0 },
+        "invalid episode measurements"
+    );
+    let coverage = row.coverage_max.unwrap_or(-1.0);
+    let displacement = row.block_disp_px.unwrap_or(-1.0);
+    let contacts = row.table_contact_steps.unwrap_or(-1);
+    let aloha = row.env == "aloha";
+    ensure!(
+        if row.env == "pusht" {
+            (0.0..=1.0).contains(&coverage)
+                && displacement.is_finite()
+                && displacement >= 0.0
+                && row.table_contact_steps.is_none()
+        } else {
+            (0..=row.steps).contains(&contacts)
+                && row.coverage_max.is_none()
+                && row.block_disp_px.is_none()
+        },
+        "missing or invalid environment failure measurements"
+    );
+    let rules = [
+        (row.success, 0),
+        (row.action_flip_rate > 0.35, 2),
+        (aloha && contacts >= 20, 1),
+        (
+            aloha && (row.max_reward >= 2.0 && row.final_reward < 2.0 || row.max_reward == 1.0),
+            3,
+        ),
+        (
+            aloha && row.max_reward == 3.0 || !aloha && coverage >= 0.5,
+            4,
+        ),
+        (aloha || displacement < 20.0, 5),
+        (true, 4),
+    ];
+    Ok(rules
+        .into_iter()
+        .find_map(|(matches, mode)| matches.then_some(mode))
+        .unwrap())
+}
+
+fn guide_insert(connection: &Connection, table: &str, row: Value, keys: &[&str]) -> Result<()> {
+    let object = row.as_object().unwrap();
+    let cols: Vec<_> = object.keys().map(String::as_str).collect();
+    let fields = cols.join(",");
+    let extract = |name: &str| format!("json_extract(?1,'$.{name}')");
+    let equal = |name: &str| format!("{name} IS {}", extract(name));
+    let clauses: Vec<_> = keys.iter().map(|name| equal(name)).collect();
+    let filter = clauses.join(" AND ");
+    let clauses: Vec<_> = cols.iter().map(|name| equal(name)).collect();
+    let identical = clauses.join(" AND ");
+    let json = serde_json::to_string(&row)?;
+    let sql = format!("SELECT count(*),coalesce(sum({identical}),0) FROM {table} WHERE {filter}");
+    let (count, matches): (i64, i64) =
+        connection.query_row(&sql, [&json], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    if count == 0 {
+        let values: Vec<_> = cols.iter().map(|name| extract(name)).collect();
+        let parameters = values.join(",");
+        let sql = format!("INSERT INTO {table} ({fields}) SELECT {parameters}");
+        connection.execute(&sql, [&json])?;
+    } else {
+        ensure!(
+            count == 1 && matches == 1,
+            "conflicting existing {table} row; ledger is append-only"
+        );
+    }
+    Ok(())
+}
+
+/// Atomically imports guide JSONL, preserving identical rows and printing measured label rates.
+pub fn label_jsonl(
+    ledger_path: &Path,
+    episodes: &Path,
+    changes_path: &Path,
+    scenarios_path: &Path,
+) -> Result<()> {
+    let mut changes = BTreeMap::new();
+    for card in jsonl::<Value>(changes_path)? {
+        let id = card["change_id"]
+            .as_str()
+            .context("missing change_id")?
+            .to_owned();
+        let name = card["env"].as_str().context("missing change env")?;
+        let env = guide_env(name)?.to_owned();
+        ensure!(
+            card.as_object().is_some_and(|o| o.len() == 5)
+                && card["seed"].as_u64().is_some()
+                && id.starts_with('c')
+                && id.len() >= 4
+                && id[1..].bytes().all(|b| b.is_ascii_digit())
+                && id[1..].parse::<u64>()? > 0,
+            "invalid guide change card"
+        );
+        let mut validation = card.clone();
+        validation["description"] = card["desc"].clone();
+        family(&validation)?;
+        let change = Change {
+            change_id: id.clone(),
+            env,
+            card,
+        };
+        ensure!(changes.insert(id, change).is_none(), "duplicate change ID");
+    }
+    let mut scenarios = BTreeMap::new();
+    for mut scenario in jsonl::<Scenario>(scenarios_path)? {
+        let prefix = format!("{}-s", scenario.env);
+        scenario.env = guide_env(&scenario.env)?.to_owned();
+        let rate = scenario.baseline_success;
+        ensure!(
+            scenario.scenario_id.starts_with(&prefix)
+                && scenario.params.is_object()
+                && scenario.seeds.len() == 50
+                && scenario.seeds.iter().all(|seed| *seed >= 0)
+                && scenario.seeds.iter().collect::<BTreeSet<_>>().len() == 50
+                && rate.is_some_and(|value| (0.0..=1.0).contains(&value)),
+            "invalid guide scenario"
+        );
+        ensure!(
+            scenarios
+                .insert(scenario.scenario_id.clone(), scenario)
+                .is_none(),
+            "duplicate scenario ID"
+        );
+    }
+    let mut runs: BTreeMap<(String, String, String), Run> = BTreeMap::new();
+    for row in jsonl::<GuideEpisode>(episodes)? {
+        let scenario = scenarios
+            .get(&row.scenario_id)
+            .context("unknown episode scenario")?;
+        ensure!(
+            guide_env(&row.env)? == scenario.env,
+            "episode environment disagrees with scenario"
+        );
+        let count = match row.tier.as_str() {
+            "baseline" => 50,
+            "cheap" => 3,
+            "expensive" => 20,
+            _ => bail!("unsupported episode tier"),
+        };
+        if row.tier == "baseline" {
+            ensure!(row.change_id == "base", "baseline must use base policy");
+        } else {
+            ensure!(
+                changes
+                    .get(&row.change_id)
+                    .is_some_and(|change| change.env == scenario.env),
+                "unknown change or mismatched episode env"
+            );
+        }
+        ensure!(
+            row.episode_idx < count && scenario.seeds[row.episode_idx] == row.seed,
+            "episode seed/index is not the fixed tier prefix"
+        );
+        let mode = guide_mode(&row)?;
+        let run = runs
+            .entry((row.change_id, row.scenario_id, row.tier))
+            .or_default();
+        ensure!(run.seeds.insert(row.seed), "duplicate episode seed");
+        run.successes += i64::from(row.success);
+        run.reward += row.reward_sum;
+        run.seconds += row.wall_seconds;
+        run.failures[mode] += 1;
+    }
+    for ((_, _, tier), run) in &runs {
+        ensure!(
+            run.seeds.len()
+                == match tier.as_str() {
+                    "baseline" => 50,
+                    "cheap" => 3,
+                    _ => 20,
+                }
+                && run.reward.is_finite()
+                && run.seconds.is_finite(),
+            "incomplete or nonfinite guide group"
+        );
+    }
+    for scenario in scenarios.values() {
+        let key = (
+            "base".into(),
+            scenario.scenario_id.clone(),
+            "baseline".into(),
+        );
+        let baseline = runs.get(&key).context("missing 50-episode base run")?;
+        ensure!(
+            scenario.baseline_success == Some(baseline.successes as f64 / 50.0),
+            "scenario baseline_success differs from measured episodes"
+        );
+    }
+    for (change, scenario, tier) in runs.keys().filter(|key| key.0 != "base") {
+        let other = if tier == "cheap" {
+            "expensive"
+        } else {
+            "cheap"
+        };
+        let key = (change.clone(), scenario.clone(), other.into());
+        ensure!(runs.contains_key(&key), "pair lacks cheap or expensive run");
+    }
+    let root =
+        std::env::var("BRIER_DATA").context("BRIER_DATA is required to identify episode keys")?;
+    ensure!(!root.trim().is_empty(), "BRIER_DATA must not be empty");
+    let mut connection =
+        Connection::open_with_flags(ledger_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let tx = connection.transaction()?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_secs()
+        .to_string();
+    for change in changes.values() {
+        let sql = "SELECT created_at FROM changes WHERE change_id=?1";
+        let id = &change.change_id;
+        let created: Option<String> = tx.query_row(sql, [id], |row| row.get(0)).optional()?;
+        let values = serde_json::json!({"change_id":change.change_id,"env":change.env,
+            "card_json":serde_json::to_string(&change.card)?,"created_at":created.unwrap_or_else(|| now.clone())});
+        guide_insert(&tx, "changes", values, &["change_id"])?;
+    }
+    for scenario in scenarios.values() {
+        let values = serde_json::json!({"scenario_id":scenario.scenario_id,"env":scenario.env,
+            "params_json":serde_json::to_string(&scenario.params)?,"baseline_success":scenario.baseline_success.unwrap()});
+        guide_insert(&tx, "scenarios", values, &["scenario_id"])?;
+    }
+    for ((change, scenario, tier), run) in &runs {
+        let key = format!("{change}:{scenario}:{tier}");
+        let env = if scenarios[scenario].env.contains("PushT") {
+            "pusht"
+        } else {
+            "aloha"
+        };
+        let uri = format!(
+            "{}/episodes/env={env}/tier={tier}/change={change}/{scenario}.parquet",
+            root.trim_end_matches('/')
+        );
+        let values = serde_json::json!({"run_id":Uuid::new_v5(&Uuid::NAMESPACE_URL,key.as_bytes()).to_string(),
+            "change_id":change,"scenario_id":scenario,"tier":tier,"episodes":run.seeds.len(),"successes":run.successes,
+            "mean_reward":run.reward/run.seeds.len() as f64,"uri":uri,"wall_seconds":run.seconds});
+        guide_insert(&tx, "runs", values, &["change_id", "scenario_id", "tier"])?;
+    }
+    for ((change, scenario, _), run) in runs.iter().filter(|(key, _)| key.2 == "expensive") {
+        let baseline = &runs[&("base".into(), scenario.clone(), "baseline".into())];
+        let regressed = 5 * run.successes < 2 * baseline.successes - 15;
+        let priority = [2, 1, 3, 4, 5];
+        let mode = if regressed {
+            *priority
+                .iter()
+                .enumerate()
+                .max_by_key(|(rank, mode)| (run.failures[**mode], std::cmp::Reverse(*rank)))
+                .unwrap()
+                .1
+        } else {
+            0
+        };
+        let cause = &changes[change].card["families"][0]["family"];
+        let values = serde_json::json!({"change_id":change,"scenario_id":scenario,"regressed":regressed,
+            "failure_mode":MODES[mode],"success_bucket":(run.successes/4+1).min(5),"cause_family":cause});
+        guide_insert(&tx, "labels", values, &["change_id", "scenario_id"])?;
+    }
+    let summary: String = tx.query_row(r#"
+        WITH grouped AS (
+          SELECT 'per_family' category,cause_family name,regressed FROM labels UNION ALL
+          SELECT 'per_scenario',scenario_id,regressed FROM labels UNION ALL
+          SELECT 'per_env',CASE c.env WHEN 'gym_pusht/PushT-v0' THEN 'pusht' ELSE 'aloha' END,l.regressed
+            FROM labels l JOIN changes c USING(change_id)),
+        rates AS (SELECT category,name,count(*) pairs,avg(regressed) rate FROM grouped GROUP BY category,name ORDER BY category,name),
+        distributions AS (SELECT category,json_group_object(name,json_object('pairs',pairs,'regressed_rate',rate)) value FROM rates GROUP BY category)
+        SELECT json_object('pairs',count(*),'regressed_rate',avg(regressed),
+          'per_family',json((SELECT value FROM distributions WHERE category='per_family')),
+          'per_scenario',json((SELECT value FROM distributions WHERE category='per_scenario')),
+          'per_env',json((SELECT value FROM distributions WHERE category='per_env')),
+          'benign_false_regression_rate',(SELECT avg(regressed) FROM labels WHERE cause_family='benign'),
+          'failure_modes',json((SELECT json_group_object(failure_mode,n) FROM (SELECT failure_mode,count(*) n FROM labels GROUP BY failure_mode ORDER BY failure_mode)))) FROM labels
+        "#, [], |row| row.get(0))?;
+    tx.commit()?;
+    println!("{summary}");
+    Ok(())
 }
 
 #[cfg(test)]
