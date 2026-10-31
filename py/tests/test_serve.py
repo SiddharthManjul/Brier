@@ -20,8 +20,8 @@ _SPEC.loader.exec_module(serving)
 
 class _Tokenizer:
     def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
-        assert add_special_tokens is False
-        return [ord(char) for char in text]
+        suffix = len(text) >= 2 and text[-2] == " " and text[-1] in "ABCDEF"
+        return ([1] if add_special_tokens else []) + ([ord(char) for char in text[:-2]] + [1000 + ord(text[-1])] if suffix else [ord(char) for char in text])
 
 
 def _questions() -> list[dict[str, Any]]:
@@ -84,10 +84,55 @@ def test_missing_logprob_fails_loudly() -> None:
 def test_multiple_tokens_and_context_mismatch_fail() -> None:
     class BadTokenizer(_Tokenizer):
         def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
-            return [1, 2] if len(text) == 1 else super().encode(text, add_special_tokens=add_special_tokens)
+            return [1, 2] if text in {" " + letter for letter in "ABCDEF"} else super().encode(text, add_special_tokens=add_special_tokens)
 
     with pytest.raises(ValueError, match="distinct single tokens"):
         serving.score_options(_generate, BadTokenizer(), _questions())
+
+    class BoundaryTokenizer(_Tokenizer):
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            ids = super().encode(text, add_special_tokens=add_special_tokens)
+            return ids[:-1] + [999] if text.endswith("> A") else ids
+
+    with pytest.raises(ValueError, match="distinct single tokens"):
+        serving.score_options(_generate, BoundaryTokenizer(), _questions())
+
+
+@pytest.mark.parametrize("array_options", [True, False])
+@pytest.mark.parametrize("scenario", ["pusht-s01", "aloha-s01", "aloha_transfer_cube-s01"])
+def test_guide_questions_use_default_special_tokens_and_spaced_answer_tokens(array_options, scenario) -> None:
+    questions = [{"id": f"c001:{scenario}:{kind}:ev", "prompt": f"{kind}\n<answer>",
+                  "options": sorted(answers)} for kind, answers in serving._GUIDE_ANSWERS.items()]
+    if not array_options:
+        for question in questions:
+            question["options"] = dict(zip("ABCDEF", question["options"]))
+
+    class Tokenizer(_Tokenizer):
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            assert add_special_tokens == (not text.startswith(" "))
+            return super().encode(text, add_special_tokens=add_special_tokens)
+
+    def generate(prompts, ids):
+        assert prompts == [question["prompt"] for question in questions]
+        assert ids[0] == [1000 + ord("A"), 1000 + ord("B")]
+        return _generate(prompts, ids)
+
+    assert set(serving.score_options(generate, Tokenizer(), questions)) == {question["id"] for question in questions}
+    questions[1]["options"] = [*sorted(serving._GUIDE_ANSWERS["failure_mode"]), "extra"]
+    with pytest.raises(ValueError, match="option count"):
+        serving.score_options(generate, Tokenizer(), questions)
+
+
+def test_live_aloha_transport_accepts_guide_scenario_with_legacy_option_semantics() -> None:
+    questions = _questions()
+    for question in questions:
+        question["id"] = question["id"].replace("pusht-s01", "aloha-s01")
+        kind = question["id"].split("/")[2]
+        question["prompt"] = "<system> exact\n<state>\nSCENARIO: env=aloha_transfer_cube pose_bin=1\n</state>\n<question> exact\n<options> " + "  ".join(
+            f"{letter}) {text}" for letter, text in zip("ABCDEF", sorted(serving._GUIDE_ANSWERS[kind]))) + "\n<answer>"
+    result = serving.score_options(_generate, _Tokenizer(), questions)
+    assert set(result) == {question["id"] for question in questions}
+    assert [len(result[question["id"]]) for question in questions] == [2, 6, 5]
 
 
 def test_load_requires_model_and_immutable_revision_before_importing_vllm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -134,7 +179,7 @@ def test_load_requests_raw_complete_option_scores_and_exact_token_ids(
             calls["inputs"], calls["parameters"] = prompts, parameters
             calls["request"] = kwargs
             assert use_tqdm is False
-            return _generate([], [parameter["allowed_token_ids"] for parameter in parameters])
+            return _generate([], [[1000 + ord(letter) for letter in row["options"]] for row in _questions()])
 
     monkeypatch.setenv("MODAL_MODEL_ID", "configured/model")
     monkeypatch.setenv("MODAL_MODEL_REVISION", "a" * 40)
@@ -143,7 +188,7 @@ def test_load_requests_raw_complete_option_scores_and_exact_token_ids(
         _lora_checkpoint(tmp_path, monkeypatch)
         monkeypatch.setattr(serving, "_checkpoint_path", lambda: tmp_path)
     def sampling_params(**kwargs: Any) -> dict[str, Any]:
-        assert kwargs["logprobs"] == len(kwargs["logprob_token_ids"])
+        assert kwargs == {"max_tokens": 1, "logprobs": 20, "temperature": 0.0}
         return kwargs
 
     monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=Engine, SamplingParams=sampling_params))
@@ -165,10 +210,10 @@ def test_load_requests_raw_complete_option_scores_and_exact_token_ids(
         assert "enable_lora" not in calls["engine"] and calls["request"] == {}
         assert version == "configured/model@" + "a" * 40
     for question, tokens, parameters in zip(_questions(), calls["inputs"], calls["parameters"], strict=True):
-        assert tokens == {"prompt_token_ids": tokenizer.encode(question["prompt"], add_special_tokens=False)}
+        assert tokens == {"prompt_token_ids": tokenizer.encode(question["prompt"], add_special_tokens=True)}
         assert parameters["max_tokens"] == 1
-        assert parameters["logprobs"] == len(parameters["logprob_token_ids"])
-        assert parameters["allowed_token_ids"] == parameters["logprob_token_ids"]
+        assert parameters["logprobs"] == 20 and parameters["temperature"] == 0.0
+        assert "allowed_token_ids" not in parameters and "logprob_token_ids" not in parameters
 
 
 def _lora_checkpoint(directory: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
