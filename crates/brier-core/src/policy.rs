@@ -45,6 +45,7 @@ pub fn calibrate(changes: &[LabeledChange], alpha: f64) -> Result<Policy> {
         "alpha must be finite and between zero and one"
     );
     ensure!(!changes.is_empty(), "calibration changes must not be empty");
+
     let mut change_ids = HashSet::new();
     let mut candidates = vec![0.0, 1.0];
     for change in changes {
@@ -56,6 +57,7 @@ pub fn calibrate(changes: &[LabeledChange], alpha: f64) -> Result<Policy> {
         );
         candidates.extend(change.pairs.iter().map(|pair| pair.probability));
     }
+
     let denominator = changes.len() as f64 + 1.0;
     let minimum_bound = 1.0 / denominator;
     ensure!(
@@ -65,6 +67,7 @@ pub fn calibrate(changes: &[LabeledChange], alpha: f64) -> Result<Policy> {
         changes.len(),
         minimum_bound
     );
+
     candidates.sort_by(f64::total_cmp);
     candidates.dedup_by(|left, right| left == right);
     let lambda = candidates
@@ -78,6 +81,7 @@ pub fn calibrate(changes: &[LabeledChange], alpha: f64) -> Result<Policy> {
             (total_loss + 1.0) / denominator <= alpha
         })
         .context("no calibration threshold satisfies the finite-sample bound")?;
+
     Ok(Policy {
         alpha,
         lambda,
@@ -95,6 +99,7 @@ fn validate_change(change: &LabeledChange) -> Result<()> {
         "change {} has no scenario pairs",
         change.change_id
     );
+
     let mut scenario_ids = HashSet::new();
     for pair in &change.pairs {
         ensure!(
