@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import copy
 import hashlib
 import json
 import os
@@ -7,6 +9,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -242,3 +245,134 @@ def predict_head(embeddings: Path, checkpoint: Path) -> dict[str, dict[str, floa
                 for letter, semantic in row["options"].items()
             }
     return predictions
+
+
+def _guide_inputs(base: Path, compiled: Path) -> tuple[dict, str]:
+    from brier_ml import glimmer_data as data
+
+    examples = data.load_examples(compiled, _SPLITS)
+    indexed, result, revisions, width = {row["id"]: row for row in examples}, {}, set(), None
+    for split in ("train", "calibration", "test", "ood"):
+        ids = json.loads((base / "emb" / f"{split}.ids.json").read_text())
+        matrix = np.load(base / "emb" / f"{split}.npy", allow_pickle=False)
+        expected = {row["id"] for row in examples if row["split"] == split}
+        if (not isinstance(ids, list) or not ids or any(not isinstance(i, str) for i in ids)
+                or len(set(ids)) != len(ids) or set(ids) != expected
+                or matrix.dtype != np.float16 or matrix.ndim != 2 or matrix.shape[0] != len(ids)
+                or not matrix.shape[1] or not np.isfinite(matrix).all()
+                or (width is not None and width != matrix.shape[1])):
+            raise ValueError(f"invalid embedding matrix or compiled-id join for {split}")
+        scored = [json.loads(line) for line in (base / "probs" / f"{split}.jsonl").read_text().splitlines()]
+        if (any(not isinstance(row, dict) for row in scored)
+                or len(scored) != len(ids) or {row.get("id") for row in scored} != expected
+                or any(row.get("model") != "glimmer-base-zeroshot"
+                       or re.fullmatch(r"[0-9a-f]{40}", str(row.get("revision"))) is None
+                       or any(row.get(key) != indexed[row["id"]][key] for key in
+                              ("pair_id", "split", "question", "variant", "options", "label")) for row in scored)):
+            raise ValueError(f"base scoring provenance disagrees with embeddings for {split}")
+        revisions.update(row["revision"] for row in scored)
+        width, rows = matrix.shape[1], [indexed[identity] for identity in ids]
+        k = torch.tensor([len(row["options"]) for row in rows])
+        ordinal = torch.full((len(rows), 6), -1, dtype=torch.long)
+        for i, row in enumerate(rows):
+            if row["question"] == "success_bucket":
+                ordinal[i, :5] = torch.tensor([data._OPTIONS["success_bucket"].index(v) for v in row["options"]])
+        result[split] = (rows, torch.from_numpy(matrix).float(), torch.arange(6)[None, :] < k[:, None],
+                         torch.tensor(["ABCDEF".index(row["label"]) for row in rows]),
+                         torch.tensor([row["question"] == "success_bucket" for row in rows]), ordinal)
+    if len(revisions) != 1:
+        raise ValueError("base scoring splits must share one pinned revision")
+    return result, revisions.pop()
+
+
+def _guide_logits(model: nn.ModuleDict, vectors: torch.Tensor, rows: list[dict]) -> torch.Tensor:
+    hidden, logits = model["trunk"](vectors), vectors.new_zeros((len(rows), 6))
+    for question, values in _VALUES.items():
+        indices = [i for i, row in enumerate(rows) if row["question"] == question]
+        if indices:
+            logits[indices, :len(values)] = model[question](hidden[indices])
+    if not torch.isfinite(logits).all():
+        raise ValueError("frozen head produced nonfinite logits")
+    return logits
+
+
+def _guide_fit(inputs: dict) -> tuple[nn.ModuleDict, dict]:
+    from brier_ml.losses import proper_loss
+
+    train, calibration = inputs["train"], inputs["calibration"]
+    if {row["question"] for row in train[0]} != set(_VALUES):
+        raise ValueError("train embeddings must contain all three questions")
+    regressed = [i for i, row in enumerate(calibration[0]) if row["question"] == "regressed"]
+    if not regressed:
+        raise ValueError("calibration requires regressed examples for early stopping")
+    mean, std = train[1].mean(0), train[1].std(0, unbiased=False).clamp_min(1e-6)
+    x, cx = (train[1] - mean) / std, (calibration[1] - mean) / std
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(2026)
+        model = nn.ModuleDict({"trunk": nn.Sequential(nn.Linear(x.shape[1], 256), nn.GELU(), nn.Dropout(0.1)),
+                               **{q: nn.Linear(256, len(v)) for q, v in _VALUES.items()}}).cpu()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        history, best, stale, state, best_epoch = [], float("inf"), 0, None, 0
+        for epoch in range(1, 41):
+            model.train()
+            order = torch.randperm(len(x))
+            for indices in order.split(256):
+                rows = [train[0][i] for i in indices.tolist()]
+                loss, _ = proper_loss(_guide_logits(model, x[indices], rows),
+                                      *(value[indices] for value in train[2:]))
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+            model.eval()
+            with torch.no_grad():
+                logits = _guide_logits(model, cx[regressed], [calibration[0][i] for i in regressed])
+                nll = float(nn.functional.cross_entropy(logits[:, :2], calibration[3][regressed]))
+            history.append({"epoch": epoch, "calibration_regressed_nll": nll})
+            if nll < best:
+                best, stale, state, best_epoch = nll, 0, copy.deepcopy(model.state_dict()), epoch
+            else:
+                stale += 1
+            if stale == 5:
+                break
+        model.load_state_dict(state)
+    return model, {"mean": mean, "std": std, "history": history, "best_epoch": best_epoch,
+                   "calibration_regressed_nll": best, "seed": 2026}
+
+
+def _guide_main() -> None:
+    parser = argparse.ArgumentParser(description="Train the CPU Glimmer frozen head")
+    for name in ("base", "compiled", "out"):
+        parser.add_argument("--" + name, type=Path, required=True)
+    args = parser.parse_args()
+    if args.out.exists():
+        raise FileExistsError(f"output already exists: {args.out}")
+    inputs, revision = _guide_inputs(args.base, args.compiled)
+    model, meta = _guide_fit(inputs)
+    args.out.mkdir(parents=True)
+    (args.out / "probs").mkdir()
+    torch.save({"format": "brier-glimmer-frozen-head-v2", "state_dict": model.state_dict(),
+                "dimension": len(meta["mean"]), "mean": meta["mean"], "std": meta["std"],
+                "revision": revision}, args.out / "head.pt")
+    summary = {key: value for key, value in meta.items() if key not in {"mean", "std"}}
+    summary.update(model="glimmer-frozen-head", revision=revision, device="cpu",
+                   compiled_sha256=hashlib.sha256(args.compiled.read_bytes()).hexdigest())
+    (args.out / "meta.json").write_text(json.dumps(summary, allow_nan=False) + "\n")
+    model.eval()
+    with torch.no_grad():
+        for split in ("calibration", "test", "ood"):
+            rows, vectors, *_ = inputs[split]
+            logits = _guide_logits(model, (vectors - meta["mean"]) / meta["std"], rows)
+            predictions = []
+            for row, values in zip(rows, logits, strict=True):
+                letters = "ABCDEF"[:len(row["options"])]
+                probabilities = values[:len(letters)].softmax(-1).tolist()
+                predictions.append({key: row[key] for key in
+                                    ("id", "pair_id", "split", "question", "variant", "options", "label")}
+                                   | {"logits": values.tolist(), "probs": dict(zip(letters, probabilities, strict=True)),
+                                      "model": "glimmer-frozen-head", "revision": revision})
+            (args.out / "probs" / f"{split}.jsonl").write_text(
+                "".join(json.dumps(row, allow_nan=False) + "\n" for row in predictions))
+
+
+if __name__ == "__main__":
+    _guide_main()
