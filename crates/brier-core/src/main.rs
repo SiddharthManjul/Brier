@@ -26,8 +26,12 @@ enum Command {
         ledger: PathBuf,
         #[arg(long)]
         episodes: PathBuf,
-        #[arg(long)]
-        catalog: PathBuf,
+        #[arg(long, required_unless_present = "changes", conflicts_with_all = ["changes", "scenarios"])]
+        catalog: Option<PathBuf>,
+        #[arg(long, requires = "scenarios")]
+        changes: Option<PathBuf>,
+        #[arg(long, requires = "changes")]
+        scenarios: Option<PathBuf>,
     },
     Card {
         #[arg(long)]
@@ -99,7 +103,12 @@ fn main() -> Result<()> {
             ledger,
             episodes,
             catalog,
-        } => label::label(&ledger, &episodes, &catalog)?,
+            changes,
+            scenarios,
+        } => match catalog {
+            Some(catalog) => label::label(&ledger, &episodes, &catalog)?,
+            None => label::label_jsonl(&ledger, &episodes, &changes.unwrap(), &scenarios.unwrap())?,
+        },
         Command::Card {
             before,
             after,
