@@ -147,6 +147,8 @@ def test_loader_pins_config_and_weights_to_same_cpu_checkpoint(
     from lerobot.policies import factory as policy_factory
 
     pin = {"repo_id": envs._POLICIES[env_name], "revision": "a" * 40}
+    if env_name == "pusht":
+        pin["num_inference_steps"] = 10
     (tmp_path / "pins.json").write_text(json.dumps({
         "lerobot_version": "0.3.3", "policies": {env_name: pin},
     }))
@@ -171,6 +173,10 @@ def test_loader_pins_config_and_weights_to_same_cpu_checkpoint(
     def make_policy(*, cfg: Any, env_cfg: Any) -> Any:
         assert cfg is config and cfg.pretrained_path == tmp_path / "snapshot"
         assert env_cfg is calls["env"][0]
+        if env_name == "pusht":
+            assert cfg.num_inference_steps == 10
+        else:
+            assert not hasattr(cfg, "num_inference_steps")
         return loaded[1]
 
     def load_model(policy: Any, filename: str, *, strict: bool, device: str) -> None:
@@ -192,6 +198,29 @@ def test_loader_pins_config_and_weights_to_same_cpu_checkpoint(
     assert env_cfg.task == ("PushT-v0" if env_name == "pusht" else "AlohaTransferCube-v0")
     assert env_cfg.episode_length == (300 if env_name == "pusht" else 400)
     result[0].close()
+
+
+@pytest.mark.parametrize("env_name, steps", [
+    ("pusht", value) for value in (True, False, 0, -1, 1.5, "10", None, [], {})
+] + [("aloha", 10), ("aloha", None)])
+def test_loader_rejects_invalid_inference_override_before_download(
+    env_name: str, steps: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "pins.json").write_text(json.dumps({
+        "lerobot_version": "0.3.3", "policies": {env_name: {
+            "repo_id": envs._POLICIES[env_name], "revision": "a" * 40,
+            "num_inference_steps": steps,
+        }},
+    }))
+    monkeypatch.setattr(envs, "__file__", str(tmp_path / "envs.py"))
+    monkeypatch.setattr(envs, "version", lambda name: "0.3.3")
+
+    def download(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("invalid inference override must be rejected before downloading weights")
+
+    monkeypatch.setattr(envs, "snapshot_download", download)
+    with pytest.raises(ValueError, match="num_inference_steps must be a positive integer for pusht only"):
+        envs._load(env_name)
 
 
 @pytest.mark.parametrize("env_name", ["pusht", "aloha"])
