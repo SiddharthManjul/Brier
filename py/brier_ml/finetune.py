@@ -121,6 +121,23 @@ def _encode(rows: list[dict[str, Any]], tokenizer: Any) -> list[dict[str, Any]]:
     return encoded
 
 
+def _text_config(config: Any) -> Any:
+    if getattr(config, "model_type", None) == "muse_glimmer":
+        text = getattr(config, "text_config", None)
+        if (
+            getattr(config, "architectures", None) != ["MuseGlimmerForConditionalGeneration"]
+            or getattr(text, "model_type", None) != "muse_glimmer_text"
+            or getattr(getattr(config, "vision_config", None), "model_type", None) != "muse_glimmer_vision"
+            or getattr(config, "is_encoder_decoder", False)
+            or getattr(text, "is_encoder_decoder", False)
+        ):
+            raise ValueError("Muse Glimmer requires its native conditional-generation and text-decoder configuration")
+        return text
+    if getattr(config, "is_encoder_decoder", False) or getattr(config, "vision_config", None) is not None:
+        raise ValueError("model must expose a supported text decoder or native Muse Glimmer text path")
+    return config
+
+
 def _load_model(identifier: str, revision: str) -> tuple[Any, Any]:
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from transformers import (
@@ -131,22 +148,34 @@ def _load_model(identifier: str, revision: str) -> tuple[Any, Any]:
     )
 
     config = AutoConfig.from_pretrained(identifier, revision=revision, trust_remote_code=False)
-    if getattr(config, "vision_config", None) is not None:
-        raise ValueError("MODAL_MODEL_ID must name a supported text-decoder-only checkpoint")
+    text_config = _text_config(config)
+    native_glimmer = getattr(config, "model_type", None) == "muse_glimmer"
+    model_class = AutoModelForCausalLM
+    if native_glimmer:
+        from transformers import MuseGlimmerForConditionalGeneration
+
+        model_class = MuseGlimmerForConditionalGeneration
     tokenizer = AutoTokenizer.from_pretrained(identifier, revision=revision, trust_remote_code=False)
-    model = AutoModelForCausalLM.from_pretrained(
+    model = model_class.from_pretrained(
         identifier, revision=revision, config=config, trust_remote_code=False,
         quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                                              bnb_4bit_compute_dtype=torch.bfloat16),
-        torch_dtype=torch.bfloat16, device_map={"": torch.cuda.current_device()},
+        dtype=torch.bfloat16, device_map={"": torch.cuda.current_device()},
     )
-    suffixes = {name.rsplit(".", 1)[-1] for name, _ in model.named_modules()}
+    targets = _PROJECTIONS
+    if native_glimmer:
+        targets = [name for name, _ in model.named_modules() if re.fullmatch(
+            r"model\.language_model\.layers\.[0-9]+\.(?:self_attn|mlp)\." + "(?:" + "|".join(_PROJECTIONS) + ")", name
+        )]
+    suffixes = {name.rsplit(".", 1)[-1] for name in targets} if native_glimmer else {
+        name.rsplit(".", 1)[-1] for name, _ in model.named_modules()
+    }
     if not set(_PROJECTIONS).issubset(suffixes):
         raise ValueError("text decoder does not expose all required attention and MLP projections")
-    model.config.use_cache = False
+    config.use_cache = text_config.use_cache = model.config.use_cache = False
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
     model = get_peft_model(model, LoraConfig(
-        r=16, lora_alpha=32, lora_dropout=0.05, target_modules=_PROJECTIONS,
+        r=16, lora_alpha=32, lora_dropout=0.05, target_modules=targets,
         bias="none", task_type="CAUSAL_LM",
     ))
     return model, tokenizer
@@ -164,6 +193,10 @@ def _save(
                 "torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all()},
     }
     model.save_pretrained(directory / "adapter")
+    manifest = directory / "adapter" / "brier-model.json"
+    manifest_temp = manifest.with_suffix(".json.tmp")
+    manifest_temp.write_text(json.dumps({"config": config, "step": step}, sort_keys=True) + "\n")
+    manifest_temp.replace(manifest)
     temporary = directory / "training-state.tmp"
     torch.save(state, temporary)
     temporary.replace(directory / "training-state.pt")
@@ -173,7 +206,19 @@ def _save(
 def _fit(
     model: Any, encoded: list[dict[str, Any]], directory: Path,
     config: dict[str, Any], smoke: bool, commit: Callable[[], None],
+    *, teacher_distributions: list[list[float]] | None = None,
 ) -> dict[str, Any]:
+    if teacher_distributions is not None:
+        if not isinstance(teacher_distributions, list) or len(teacher_distributions) != len(encoded) or any(
+            not isinstance(values, list) or len(values) != len(row["option_tokens"])
+            or any(type(value) not in (int, float) or not 0 <= value <= 1 or not math.isfinite(value)
+                   for value in values)
+            or not math.isclose(sum(values), 1.0, abs_tol=1e-6, rel_tol=0)
+            for row, values in zip(encoded, teacher_distributions, strict=True)
+        ):
+            raise ValueError("teacher distributions must match encoded options and sum to one")
+        digest = hashlib.sha256(json.dumps(teacher_distributions, allow_nan=False).encode()).hexdigest()
+        config = {**config, "distillation_digest": digest}
     directory.mkdir(parents=True, exist_ok=True)
     total = 50 if smoke else math.ceil(len(encoded) / 32)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
@@ -212,11 +257,15 @@ def _fit(
         count = 32 if smoke else min(32, len(encoded) - cursor)
         optimizer.zero_grad(set_to_none=True)
         for offset in range(count):
-            row = encoded[(cursor + offset) % len(encoded)]
+            index = (cursor + offset) % len(encoded)
+            row = encoded[index]
             inputs = torch.tensor([row["tokens"]], dtype=torch.long, device=device)
             logits = model(input_ids=inputs, use_cache=False).logits[0, -1, row["option_tokens"]]
-            loss = option_loss(logits, row["target"], row["question"], row["values"]) / count
-            loss.backward()
+            loss = option_loss(logits, row["target"], row["question"], row["values"])
+            if teacher_distributions is not None:
+                teacher = torch.tensor(teacher_distributions[index], dtype=torch.float32, device=device)
+                loss = loss + F.kl_div(F.log_softmax(logits.float(), dim=0), teacher, reduction="sum")
+            (loss / count).backward()
             tokens += len(row["tokens"])
         optimizer.step()
         scheduler.step()
@@ -236,9 +285,7 @@ def _fit(
     return result
 
 
-def train(compiled: Path, smoke: bool = False) -> dict[str, Any]:
-    """Train or resume a text-decoder QLoRA adapter using verbatim compiled prompts."""
-    identifier, revision = _required("MODAL_MODEL_ID"), _required("MODAL_MODEL_REVISION")
+def _training_paths(compiled: Path, smoke: bool, revision: str) -> tuple[Path, str]:
     directory = Path(_required("MODAL_CHECKPOINT_DIR")).expanduser().resolve()
     data = _required("BRIER_DATA")
     volume_name = _required("MODAL_VOLUME_NAME")
@@ -250,16 +297,20 @@ def train(compiled: Path, smoke: bool = False) -> dict[str, Any]:
         raise ValueError("BRIER_DATA and MODAL_CHECKPOINT_DIR must reside under the /checkpoints Volume mount")
     if not compiled.resolve().is_relative_to(Path(data).resolve()):
         raise ValueError("compiled JSONL must reside inside BRIER_DATA")
-    rows = load_training_data(compiled)
+    return directory, volume_name
+
+
+def _seed_training() -> None:
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
         raise RuntimeError("QLoRA requires a CUDA GPU supporting bfloat16")
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
-    model, tokenizer = _load_model(identifier, revision)
-    encoded = _encode(rows, tokenizer)
-    config = {"model_id": identifier, "revision": revision, "smoke": smoke,
+
+
+def _training_config(identifier: str, revision: str, compiled: Path, model: Any, smoke: bool) -> dict[str, Any]:
+    return {"model_id": identifier, "revision": revision, "smoke": smoke,
               "dataset_digest": hashlib.sha256(compiled.read_bytes()).hexdigest(),
               "base_config": model.config.to_dict(),
               "recipe": {"batch": 32, "sequence": 1536, "epochs": 1, "lr": 1e-4,
@@ -267,6 +318,17 @@ def train(compiled: Path, smoke: bool = False) -> dict[str, Any]:
                          "seed": 0, "proper_loss_weight": 1.0,
                          "lora_rank": 16, "lora_alpha": 32, "lora_dropout": 0.05,
                          "projections": _PROJECTIONS, "quantization": "nf4", "compute": "bf16"}}
+
+
+def train(compiled: Path, smoke: bool = False) -> dict[str, Any]:
+    """Train or resume a text-decoder QLoRA adapter using verbatim compiled prompts."""
+    identifier, revision = _required("MODAL_MODEL_ID"), _required("MODAL_MODEL_REVISION")
+    directory, volume_name = _training_paths(compiled, smoke, revision)
+    rows = load_training_data(compiled)
+    _seed_training()
+    model, tokenizer = _load_model(identifier, revision)
+    encoded = _encode(rows, tokenizer)
+    config = _training_config(identifier, revision, compiled, model, smoke)
     volume = modal.Volume.from_name(volume_name)
     return _fit(model, encoded, directory, config, smoke, volume.commit)
 
@@ -274,7 +336,7 @@ def train(compiled: Path, smoke: bool = False) -> dict[str, Any]:
 app = modal.App("brier-finetune")
 _image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch==2.7.1", "transformers==4.57.1", "peft==0.17.1",
+    .pip_install("torch==2.7.1", "transformers==5.15.0", "peft==0.19.1",
                  "accelerate==1.10.1", "bitsandbytes==0.49.2", "numpy==2.2.6", "modal==1.6.3")
     .add_local_python_source("brier_ml")
 )
