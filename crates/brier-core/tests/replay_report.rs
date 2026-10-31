@@ -92,6 +92,55 @@ fn report_uses_ledger_truth_preserves_heldout_metrics_and_is_seeded() {
 }
 
 #[test]
+fn report_reads_guide_ids_without_changing_pair_weights_or_scores() {
+    let (directory, ledger, compiled, predictions) = fixture();
+    let original = directory.join("legacy.json");
+    write_report(&ledger, &compiled, &predictions, &original, 0.05, 42).unwrap();
+    let source = fs::read_to_string(&compiled).unwrap();
+    let mut rows = Vec::new();
+    for line in source.lines() {
+        let row: Value = serde_json::from_str(line).unwrap();
+        let parts: Vec<_> = row["id"].as_str().unwrap().split('/').collect();
+        rows.push(json!({"id":format!("{}:{}:regressed:ev",parts[0],parts[1]),
+            "pair_id":format!("{}:{}",parts[0],parts[1]),"change_id":parts[0],"scenario_id":parts[1],
+            "env":"pusht","variant":"ev","question":"regressed","options":["yes","no"],
+            "prompt":"fixture<answer>","label":"A","split":row["split"]}));
+    }
+    fs::write(
+        &compiled,
+        rows.iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let input = fs::read_to_string(&predictions)
+        .unwrap()
+        .replace("/pusht-s01/regressed/cheap", ":pusht-s01:regressed:ev");
+    fs::write(&predictions, input).unwrap();
+    let output = directory.join("guide.json");
+    write_report(&ledger, &compiled, &predictions, &output, 0.05, 42).unwrap();
+    assert_eq!(fs::read(original).unwrap(), fs::read(output).unwrap());
+    rows[0]["change_id"] = json!("c999");
+    fs::write(
+        &compiled,
+        rows.iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    assert!(write_report(
+        &ledger,
+        &compiled,
+        &predictions,
+        &directory.join("bad.json"),
+        0.05,
+        42
+    )
+    .is_err());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn report_rejects_test_fitting_missing_predictions_and_incomplete_measurements() {
     let (directory, ledger, compiled, predictions) = fixture();
     let original: Value = serde_json::from_slice(&fs::read(&predictions).unwrap()).unwrap();
