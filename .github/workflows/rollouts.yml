@@ -8,7 +8,7 @@ on:
       shard_offset: {description: First shard, type: number, default: 0}
       shard_count: {description: Shards in this dispatch, type: number, default: 20}
 permissions: {contents: read, id-token: write}
-concurrency: {group: brier-rollouts, cancel-in-progress: false}
+concurrency: {group: 'brier-rollouts-${{ inputs.phase == ''timing'' && inputs.env || ''collection'' }}', cancel-in-progress: false}
 env:
   BRIER_DATA: ${{ vars.BRIER_DATA }}
   HF_TOKEN: ${{ secrets.HF_TOKEN }}
