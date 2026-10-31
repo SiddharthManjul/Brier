@@ -53,6 +53,12 @@ def _fixture(tmp_path):
                                      "split": split, "question": question, "variant": variant,
                                      "options": options, "label": "ABCDEF"[target], "prompt": prompt})
                     vectors.append([10 * int(i == target) + 2 for i in range(6)] + [3])
+        if split == "calibration":
+            change_ids = [f"c{index:03}" for index in range(1, 1000)
+                          if 6 <= int.from_bytes(hashlib.sha256(f"c{index:03}".encode()).digest()[:4], "big") % 10 < 8][:20]
+            selected = [{key: value.replace(change, identity) if key in {"id", "pair_id", "change_id", "prompt"} else value
+                         for key, value in row.items()} for identity in change_ids for row in selected]
+            vectors *= len(change_ids)
         rows.extend(selected)
         # Deliberately use embedding order rather than the compiled file's order.
         selected.reverse()
@@ -102,6 +108,11 @@ def test_cli_learns_separable_embeddings_and_preserves_m6_join(tmp_path, monkeyp
     meta = json.loads((out / "meta.json").read_text())
     assert meta["device"] == "cpu" and meta["seed"] == 2026
     assert meta["compiled_sha256"] == hashlib.sha256(compiled.read_bytes()).hexdigest()
+    calibration_ids = [row["change_id"] for row in data.load_examples(compiled, ["calibration"])]
+    fit_ids, risk_ids = data.calibration_partition(calibration_ids)
+    assert meta["calibration_partition"] == {"fit_change_ids": fit_ids, "risk_change_ids": risk_ids}
+    calibration_predictions = [json.loads(line) for line in (out / "probs/calibration.jsonl").read_text().splitlines()]
+    assert {row["id"].split(":")[0] for row in calibration_predictions} == set(fit_ids) | set(risk_ids)
     with pytest.raises(FileExistsError):
         _cli(monkeypatch, base, compiled, out)
 
@@ -117,7 +128,8 @@ def test_early_stopping_uses_only_calibration_regressed_and_restores_best(tmp_pa
     history = meta["history"]
     assert 6 <= len(history) < 40
     assert len(history) == meta["best_epoch"] + 5
-    rows = [i for i, row in enumerate(cal[0]) if row["question"] == "regressed"]
+    rows = [i for i, row in enumerate(cal[0]) if row["question"] == "regressed"
+            and row["change_id"] in meta["calibration_partition"]["fit_change_ids"]]
     with torch.no_grad():
         logits = frozen._guide_logits(model, (cal[1][rows] - meta["mean"]) / meta["std"], [cal[0][i] for i in rows])
     assert torch.nn.functional.cross_entropy(logits[:, :2], cal[3][rows]).item() == pytest.approx(
@@ -173,6 +185,38 @@ def test_standardizer_and_fit_never_use_test_ood_rows_or_heldout_statistics(tmp_
     assert torch.equal(meta["std"], shifted_calibration["std"])
 
 
+def test_risk_calibration_labels_never_change_head_early_stopping_or_fit_metrics(tmp_path, monkeypatch):
+    base, compiled, _ = _fixture(tmp_path)
+    first, second = tmp_path / "head-before", tmp_path / "head-after"
+    _cli(monkeypatch, base, compiled, first)
+    before = json.loads((first / "meta.json").read_text())
+    risk_ids = set(before["calibration_partition"]["risk_change_ids"])
+    original_rows = [json.loads(line) for line in compiled.read_text().splitlines()]
+    risk_predictions = {row["id"] for row in original_rows if row["change_id"] in risk_ids}
+    for row in original_rows:
+        if row["change_id"] in risk_ids:
+            row["label"] = "ABCDEF"[("ABCDEF".index(row["label"]) + 1) % len(row["options"])]
+    compiled.write_text("".join(json.dumps(row) + "\n" for row in original_rows))
+    labels = {row["id"]: row["label"] for row in original_rows}
+    score_path = base / "probs/calibration.jsonl"
+    scored = [json.loads(line) for line in score_path.read_text().splitlines()]
+    score_path.write_text("".join(json.dumps({**row, "label": labels[row["id"]]}) + "\n" for row in scored))
+    _cli(monkeypatch, base, compiled, second)
+    left, right = (torch.load(out / "head.pt", weights_only=True) for out in (first, second))
+    assert all(torch.equal(value, right["state_dict"][key]) for key, value in left["state_dict"].items())
+    after = json.loads((second / "meta.json").read_text())
+    assert {key: value for key, value in before.items() if key != "compiled_sha256"} == {
+        key: value for key, value in after.items() if key != "compiled_sha256"}
+    assert len(risk_ids) == 19 and before["best_epoch"] == after["best_epoch"]
+    for split in _SPLITS[1:]:
+        left = [json.loads(line) for line in (first / "probs" / f"{split}.jsonl").read_text().splitlines()]
+        right = [json.loads(line) for line in (second / "probs" / f"{split}.jsonl").read_text().splitlines()]
+        assert {row["id"]: row["probs"] for row in left} == {row["id"]: row["probs"] for row in right}
+        if split == "calibration":
+            assert risk_predictions <= {row["id"] for row in right}
+            assert all(row["label"] == labels[row["id"]] for row in right)
+
+
 @pytest.mark.parametrize("corruption", ["missing", "duplicate", "wrong_split", "dtype", "rank", "dimension",
                                        "nan", "empty", "revision", "mismatched_revision", "metadata"])
 def test_rejects_bad_embedding_joins_and_scoring_provenance(tmp_path, corruption):
@@ -220,6 +264,8 @@ def test_rejects_missing_training_question_or_calibration_regressed(tmp_path):
     with pytest.raises(ValueError, match="all three"):
         frozen._guide_fit(inputs)
     inputs["train"] = original
-    inputs["calibration"] = ([], *inputs["calibration"][1:])
+    calibration = inputs["calibration"]
+    indices = [i for i, row in enumerate(calibration[0]) if row["question"] != "regressed"]
+    inputs["calibration"] = ([calibration[0][i] for i in indices], *(tensor[indices] for tensor in calibration[1:]))
     with pytest.raises(ValueError, match="calibration requires"):
         frozen._guide_fit(inputs)
