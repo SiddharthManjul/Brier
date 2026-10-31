@@ -283,3 +283,38 @@ def test_length_grouped_order_matches_seeded_chunk_algorithm() -> None:
 def test_length_grouped_order_rejects_invalid_arguments(lengths: list[int], micro: int, seed: int) -> None:
     with pytest.raises(ValueError):
         data.length_grouped_order(lengths, micro, seed)
+
+
+def test_calibration_partition_reserves_nineteen_label_free_changes_invariant_to_order_and_duplicates() -> None:
+    ids = [f"c{i:03}" for i in range(1, 41)]
+    labels = {change: i % 2 for i, change in enumerate(ids)}
+    fit, risk = data.calibration_partition(labels)
+    assert (fit, risk) == data.calibration_partition(reversed(ids + ids))
+    assert (fit, risk) == data.calibration_partition({change: 1 - label for change, label in labels.items()})
+    assert len(risk) == 19 and len(fit) == 21
+    assert set(fit).isdisjoint(risk) and set(fit) | set(risk) == set(ids)
+    assert fit == sorted(fit) and risk == sorted(risk)
+    expected = sorted(ids, key=lambda change: (hashlib.sha256(f"risk-calibration:{change}:2026".encode()).digest(), change))
+    assert risk == sorted(expected[:19])
+
+
+def test_calibration_partition_uses_id_as_hash_collision_tie_break(monkeypatch) -> None:
+    class Digest:
+        def digest(self):
+            return b"same"
+
+    monkeypatch.setattr(data.hashlib, "sha256", lambda _: Digest())
+    fit, risk = data.calibration_partition(reversed([f"c{i:03}" for i in range(1, 21)]))
+    assert fit == ["c020"] and risk == [f"c{i:03}" for i in range(1, 20)]
+
+
+@pytest.mark.parametrize("count", [0, 1, 19])
+def test_calibration_partition_requires_twenty_unique_changes(count: int) -> None:
+    with pytest.raises(ValueError, match="at least 20 unique"):
+        data.calibration_partition([f"c{i + 1:03}" for i in range(count)] * 2)
+
+
+@pytest.mark.parametrize("invalid", ["c000", "c01", "c0001", "C001", "cxyz", 1, None])
+def test_calibration_partition_requires_canonical_change_ids(invalid: Any) -> None:
+    with pytest.raises(ValueError, match="canonical cNNN"):
+        data.calibration_partition([f"c{i:03}" for i in range(1, 21)] + [invalid])
