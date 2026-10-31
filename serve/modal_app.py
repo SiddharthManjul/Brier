@@ -18,6 +18,10 @@ _ANSWERS = {
                      "grasp or drop failure", "collision", "oscillation"},
     "success_bucket": {"1", "2", "3", "4", "5"},
 }
+_GUIDE_ANSWERS = {**_ANSWERS,
+    "failure_mode": {"none", "stall or timeout", "overshoot or misalignment",
+                     "grasp or drop", "collision", "oscillation"},
+    "success_bucket": {"0-19%", "20-39%", "40-59%", "60-79%", "80-100%"}}
 
 
 def score_options(generate: _Generate, tokenizer: Any,
@@ -30,30 +34,41 @@ def score_options(generate: _Generate, tokenizer: Any,
         if not isinstance(question, dict) or set(question) != {"id", "prompt", "options"}:
             raise ValueError("each question requires exactly id, prompt, options")
         identity, prompt, options = question["id"], question["prompt"], question["options"]
-        parts = identity.split("/") if isinstance(identity, str) else []
-        if len(parts) != 4 or parts[2] not in _ANSWERS or parts[3] not in {"cheap", "no_cheap"}:
+        guide = isinstance(identity, str) and ":" in identity
+        parts = identity.split(":" if guide else "/") if isinstance(identity, str) else []
+        if (len(parts) != 4 or parts[2] not in _ANSWERS
+                or parts[3] not in ({"ev", "noev"} if guide else {"cheap", "no_cheap"})
+                or not re.fullmatch(r"c[0-9]{3,}", parts[0])
+                or not re.fullmatch(r"(?:pusht|aloha(?:_transfer_cube)?)-s[0-9]{2,}" if guide else r"(?:pusht|aloha|aloha_transfer_cube)-s[0-9]{2,}", parts[1])):
             raise ValueError("question id must be change/scenario/question/evidence")
         if not parts[0] or not parts[1] or parts[2] in kinds:
             raise ValueError("question ids must be distinct and contain a change/scenario")
+        if guide and (int(parts[0][1:]) == 0 or int(parts[1].rsplit("s", 1)[1]) == 0):
+            raise ValueError("guide change/scenario ids must be positive")
         kinds.add(parts[2])
         pairs.add((parts[0], parts[1], parts[3]))
+        if guide and isinstance(options, list):
+            if len(options) != len(_GUIDE_ANSWERS[parts[2]]):
+                raise ValueError("invalid guide option count")
+            options = dict(zip("ABCDEF", options))
+        allowed = [_GUIDE_ANSWERS[parts[2]]] if guide else [_ANSWERS[parts[2]], _GUIDE_ANSWERS[parts[2]]]
         if (
             not isinstance(prompt, str) or not prompt.endswith("<answer>")
             or not isinstance(options, dict) or set(options) != set("ABCDEF"[:len(_ANSWERS[parts[2]])])
             or not all(isinstance(value, str) for value in options.values())
-            or set(options.values()) != _ANSWERS[parts[2]]
+            or set(options.values()) not in allowed
         ):
             raise ValueError("prompt or question options do not match the compiled contract")
-        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
         if not 1 <= len(prompt_ids) <= 1535:
             raise ValueError("compiled prompt must fit the 1536-token sequence with one answer")
         ids = []
         for letter in sorted(options):
-            encoded = tokenizer.encode(letter, add_special_tokens=False)
+            encoded = tokenizer.encode(" " + letter, add_special_tokens=False)
             if (
                 len(encoded) != 1 or type(encoded[0]) is not int
                 or encoded[0] < 0 or encoded[0] in ids
-                or tokenizer.encode(prompt + letter, add_special_tokens=False) != prompt_ids + encoded
+                or tokenizer.encode(prompt + " " + letter, add_special_tokens=True) != prompt_ids + encoded
             ):
                 raise ValueError("option letters must be distinct single tokens at the answer position")
             ids.append(encoded[0])
@@ -159,10 +174,8 @@ def _load() -> tuple[_Generate, Any, str]:
     tokenizer = engine.get_tokenizer()
 
     def generate(prompts: list[str], ids: list[list[int]]) -> Sequence[Any]:
-        parameters = [SamplingParams(max_tokens=1, logprobs=len(tokens), temperature=1.0,
-                                     allowed_token_ids=tokens, logprob_token_ids=tokens)
-                      for tokens in ids]
-        inputs = [{"prompt_token_ids": tokenizer.encode(prompt, add_special_tokens=False)}
+        parameters = [SamplingParams(max_tokens=1, logprobs=20, temperature=0.0) for _ in ids]
+        inputs = [{"prompt_token_ids": tokenizer.encode(prompt, add_special_tokens=True)}
                   for prompt in prompts]
         options = {"lora_request": request} if request is not None else {}
         return engine.generate(inputs, parameters, use_tqdm=False, **options)
