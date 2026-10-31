@@ -1,0 +1,411 @@
+{
+  "id": "21165d91-6903-44bd-9822-3ce14b82912d",
+  "prevId": "00000000-0000-0000-0000-000000000000",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "public.changes": {
+      "name": "changes",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "env": {
+          "name": "env",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "title": {
+          "name": "title",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "card": {
+          "name": "card",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "pr_url": {
+          "name": "pr_url",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "changes_id_format": {
+          "name": "changes_id_format",
+          "value": "\"changes\".\"id\" ~ '^c[0-9]{3,}$' and \"changes\".\"id\" !~ '^c0+$'"
+        },
+        "changes_card_object": {
+          "name": "changes_card_object",
+          "value": "jsonb_typeof(\"changes\".\"card\") = 'object'"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.evaluations": {
+      "name": "evaluations",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "change_id": {
+          "name": "change_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "verdict": {
+          "name": "verdict",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "alpha": {
+          "name": "alpha",
+          "type": "double precision",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "lambda": {
+          "name": "lambda",
+          "type": "double precision",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "evals_run": {
+          "name": "evals_run",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "evals_total": {
+          "name": "evals_total",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "hours_saved_pct": {
+          "name": "hours_saved_pct",
+          "type": "double precision",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "model_version": {
+          "name": "model_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "evaluations_change_id_changes_id_fk": {
+          "name": "evaluations_change_id_changes_id_fk",
+          "tableFrom": "evaluations",
+          "tableTo": "changes",
+          "columnsFrom": [
+            "change_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "evaluations_verdict": {
+          "name": "evaluations_verdict",
+          "value": "\"evaluations\".\"verdict\" in ('pass', 'block')"
+        },
+        "evaluations_alpha": {
+          "name": "evaluations_alpha",
+          "value": "\"evaluations\".\"alpha\" between 0 and 1"
+        },
+        "evaluations_lambda": {
+          "name": "evaluations_lambda",
+          "value": "\"evaluations\".\"lambda\" between 0 and 1"
+        },
+        "evaluations_counts": {
+          "name": "evaluations_counts",
+          "value": "\"evaluations\".\"evals_run\" >= 0 and \"evaluations\".\"evals_total\" >= \"evaluations\".\"evals_run\""
+        },
+        "evaluations_hours": {
+          "name": "evaluations_hours",
+          "value": "\"evaluations\".\"hours_saved_pct\" between 0 and 100"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.failures": {
+      "name": "failures",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "pair_id": {
+          "name": "pair_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "keyframe_urls": {
+          "name": "keyframe_urls",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "overlay_urls": {
+          "name": "overlay_urls",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "explanation": {
+          "name": "explanation",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "failures_pair_id_pairs_id_fk": {
+          "name": "failures_pair_id_pairs_id_fk",
+          "tableFrom": "failures",
+          "tableTo": "pairs",
+          "columnsFrom": [
+            "pair_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "failures_keyframes_array": {
+          "name": "failures_keyframes_array",
+          "value": "jsonb_typeof(\"failures\".\"keyframe_urls\") = 'array'"
+        },
+        "failures_overlays_array": {
+          "name": "failures_overlays_array",
+          "value": "jsonb_typeof(\"failures\".\"overlay_urls\") = 'array'"
+        },
+        "failures_explanation_object": {
+          "name": "failures_explanation_object",
+          "value": "jsonb_typeof(\"failures\".\"explanation\") = 'object'"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.pairs": {
+      "name": "pairs",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "evaluation_id": {
+          "name": "evaluation_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "scenario_id": {
+          "name": "scenario_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "p_regress": {
+          "name": "p_regress",
+          "type": "double precision",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "action": {
+          "name": "action",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "result": {
+          "name": "result",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "success_before": {
+          "name": "success_before",
+          "type": "double precision",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "success_after": {
+          "name": "success_after",
+          "type": "double precision",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "pairs_evaluation_scenario_unique": {
+          "name": "pairs_evaluation_scenario_unique",
+          "columns": [
+            {
+              "expression": "evaluation_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "scenario_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "pairs_evaluation_id_evaluations_id_fk": {
+          "name": "pairs_evaluation_id_evaluations_id_fk",
+          "tableFrom": "pairs",
+          "tableTo": "evaluations",
+          "columnsFrom": [
+            "evaluation_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "pairs_probability": {
+          "name": "pairs_probability",
+          "value": "\"pairs\".\"p_regress\" between 0 and 1"
+        },
+        "pairs_success_before": {
+          "name": "pairs_success_before",
+          "value": "\"pairs\".\"success_before\" is null or \"pairs\".\"success_before\" between 0 and 1"
+        },
+        "pairs_success_after": {
+          "name": "pairs_success_after",
+          "value": "\"pairs\".\"success_after\" is null or \"pairs\".\"success_after\" between 0 and 1"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.reports": {
+      "name": "reports",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "suite": {
+          "name": "suite",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "body": {
+          "name": "body",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "reports_suite": {
+          "name": "reports_suite",
+          "value": "\"reports\".\"suite\" in ('robot', 'software')"
+        },
+        "reports_body_object": {
+          "name": "reports_body_object",
+          "value": "jsonb_typeof(\"reports\".\"body\") = 'object'"
+        }
+      },
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {},
+  "schemas": {},
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}
