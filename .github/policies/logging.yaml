@@ -1,0 +1,11 @@
+# Copy the same real checkpoint revision from robot.yaml before comparing these files.
+env: gym_pusht/PushT-v0
+policy:
+  id: lerobot/diffusion_pusht
+  revision: null
+description: Increase logging without changing policy behavior
+families:
+  - family: benign
+    params: {}
+logging:
+  level: debug
