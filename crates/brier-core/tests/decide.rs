@@ -19,6 +19,56 @@ use std::{
 
 static MODAL_ENV: Mutex<()> = Mutex::new(());
 
+#[test]
+fn guide_features_preserve_vector_order_aliases_and_original_cards() {
+    use brier_core::cascade::{features, NumericState};
+    let params = json!({"pose_bin":4,"lighting":"normal","camera_jitter":false});
+    for (family, source, normalized) in [
+        ("action_scale", json!({"s":1.2}), json!({"scale":1.2})),
+        ("action_bias", json!({"b":2}), json!({"drift":2})),
+        (
+            "camera_shift",
+            json!({"shift":4,"angle":3}),
+            json!({"dx":4,"dy":4,"angle":3}),
+        ),
+        (
+            "occlusion",
+            json!({"fraction":0.2}),
+            json!({"x":0,"y":0,"width":0.2,"height":0.2}),
+        ),
+    ] {
+        let guide = json!({"change_id":"c001","env":"pusht","desc":"Measured policy change","seed":2026,
+            "families":[{"family":family,"params":source}]});
+        let original = guide.clone();
+        let legacy = json!({"description":"Measured policy change","families":[{"family":family,"params":normalized}]});
+        let state = |card, params| NumericState {
+            card,
+            params,
+            env: "gym_pusht/PushT-v0",
+            cheap_successes: 2,
+            cheap_reward: 0.41,
+            baseline: 0.8,
+            fragility: 0.3,
+            similar_regressed: 3,
+        };
+        let old_params = json!({"pose_bin":3,"lighting":"normal","camera_jitter":false});
+        assert_eq!(
+            features(&state(&guide, &params)).unwrap(),
+            features(&state(&legacy, &old_params)).unwrap()
+        );
+        assert_eq!(guide, original);
+        let mut invalid = guide.clone();
+        invalid["seed"] = json!(true);
+        assert!(features(&state(&invalid, &params)).is_err());
+        let mut invalid = guide.clone();
+        invalid["env"] = json!("aloha");
+        assert!(features(&state(&invalid, &params)).is_err());
+        let mut invalid = params.clone();
+        invalid["pose_bin"] = json!(0);
+        assert!(features(&state(&guide, &invalid)).is_err());
+    }
+}
+
 struct Fixture {
     directory: PathBuf,
     ledger: PathBuf,
@@ -40,6 +90,26 @@ impl Fixture {
             INSERT INTO labels SELECT change_id,'pusht-s01',CAST(substr(change_id,2) AS INTEGER)%2,'stall/timeout',3,'action_latency' FROM changes;
             INSERT INTO runs SELECT change_id||'-cheap',change_id,scenario_id,'cheap',3,2,0.41,'raw',3.0 FROM labels;").unwrap();
         brier_core::compile::compile(&ledger, &compiled).unwrap();
+        // Decision fixtures use explicit legacy fitting pools; compiler hashing has its own tests.
+        let source = fs::read_to_string(&compiled).unwrap();
+        let legacy = source.lines().map(|line| {
+            let row: Value = serde_json::from_str(line).unwrap();
+            let change = row["change_id"].as_str().unwrap();
+            let number: usize = change[1..].parse().unwrap();
+            let options = row["options"].as_array().unwrap().iter().enumerate().map(|(index,value)| {
+                let value = match value.as_str().unwrap() {
+                    "stall or timeout" => "stall/timeout", "overshoot or misalignment" => "overshoot/misalignment",
+                    "grasp or drop" => "grasp or drop failure", "0-19%" => "1", "20-39%" => "2",
+                    "40-59%" => "3", "60-79%" => "4", "80-100%" => "5", other => other,
+                };
+                (((b'A'+index as u8) as char).to_string(),value)
+            }).collect::<std::collections::BTreeMap<_,_>>();
+            let evidence = if row["variant"] == "ev" { "cheap" } else { "no_cheap" };
+            format!("{}\n",json!({"id":format!("{}/{}/{}/{evidence}",change,row["scenario_id"].as_str().unwrap(),row["question"].as_str().unwrap()),
+                "split":if number<=6 {"train"} else if number<=8 {"calibration"} else {"test"},
+                "question":row["question"],"options":options,"prompt":row["prompt"],"label":row["label"]}))
+        }).collect::<String>();
+        fs::write(&compiled, legacy).unwrap();
         connection.execute_batch("WITH RECURSIVE n(x) AS (SELECT 100 UNION ALL SELECT x+1 FROM n WHERE x<118)
             INSERT INTO changes SELECT printf('c%03d',x),'gym_pusht/PushT-v0','{\"description\":\"risk pool\",\"families\":[{\"family\":\"action_latency\",\"params\":{\"k\":2}}]}','later' FROM n;
             INSERT INTO labels SELECT change_id,'pusht-s01',1,'stall/timeout',1,'action_latency' FROM changes WHERE change_id BETWEEN 'c100' AND 'c118';
@@ -149,6 +219,7 @@ fn server(
                 Err(error) => panic!("{error}"),
             }
         };
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
