@@ -1,0 +1,43 @@
+{
+  "name": "brier-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.30.3",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build --webpack",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "1.2.0",
+    "class-variance-authority": "0.7.1",
+    "cn": "0.5.0",
+    "drizzle-orm": "0.45.4",
+    "lucide-react": "1.64.0",
+    "next": "16.4.3",
+    "radix-ui": "1.8.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "recharts": "3.8.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/node": "24.19.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "drizzle-kit": "0.31.11",
+    "eslint": "9.39.5",
+    "eslint-config-next": "16.4.3",
+    "tailwindcss": "4.3.3",
+    "typescript": "5.9.3"
+  }
+}
