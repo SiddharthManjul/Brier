@@ -376,11 +376,24 @@ pub fn score_explanations(ledger: &Path, compiled: &Path) -> Result<Option<Value
         let id = row["id"]
             .as_str()
             .context("compiled scoring row requires id")?;
-        let change = id
-            .split('/')
-            .next()
-            .filter(|value| !value.is_empty())
-            .context("invalid compiled scoring id")?;
+        let guide = id.contains(':');
+        let parts: Vec<_> = id.split(if guide { ':' } else { '/' }).collect();
+        ensure!(
+            parts.len() == 4 && parts.iter().all(|s| !s.is_empty()),
+            "invalid compiled scoring id"
+        );
+        let change = parts[0];
+        if guide {
+            ensure!(
+                row["change_id"] == change
+                    && row["scenario_id"] == parts[1]
+                    && row["pair_id"] == format!("{}:{}", change, parts[1])
+                    && row["question"] == parts[2]
+                    && row["variant"] == parts[3]
+                    && matches!(parts[3], "ev" | "noev"),
+                "invalid guide compiled scoring identity"
+            );
+        }
         let split = row["split"]
             .as_str()
             .context("compiled scoring row requires split")?;
