@@ -70,6 +70,32 @@ def test_catalog_has_global_ids_fixed_scenarios_and_benign_fraction() -> None:
     }
 
 
+@pytest.mark.parametrize("tier,count", [("cheap", 1), ("expensive", 8)])
+def test_upload_keyframes_preserves_relative_public_paths_before_parquet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tier: str, count: int,
+) -> None:
+    relative = "public/keyframes/pusht/c001/pusht-s01/0/attempt"
+    directory = tmp_path / relative
+    directory.mkdir(parents=True)
+    for i in range(count):
+        (directory / f"frame-{i:04}.png").write_bytes(b"test-image")
+    scenario = farm.scenarios(farm._ENVS["pusht"][0])[0]
+    change = farm.catalog()["changes"][0]
+    parquet = _raw_file(tmp_path / "episode.parquet", change, scenario, tier, keyframes_uri=relative)
+    copies = []
+    monkeypatch.setattr(farm, "_copy", lambda source, target: copies.append((source, target)))
+    farm._upload_keyframes(parquet, tmp_path, "gs://test-bucket")
+    assert len(copies) == count
+    assert copies[0] == (str(directory / "frame-0000.png"),
+                         f"gs://test-bucket/{relative}/frame-0000.png")
+    (directory / "frame-0000.png").unlink()
+    with pytest.raises(ValueError, match="eight"):
+        farm._upload_keyframes(parquet, tmp_path, "gs://test-bucket")
+    parquet = _raw_file(parquet, change, scenario, "expensive", keyframes_uri="../outside")
+    with pytest.raises(ValueError, match="relative directory"):
+        farm._upload_keyframes(parquet, tmp_path, "gs://test-bucket")
+
+
 def test_shard_keys_skip_valid_results_and_reject_corruption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -104,7 +130,7 @@ def test_shard_keys_skip_valid_results_and_reject_corruption(
                         "change_id": change_id,
                         "scenario_id": scenario_id,
                         "tier": tier,
-                        "seed": seed + i,
+                        "seed": kwargs["scenario"]["seeds"][i],
                         "success": False,
                         "steps": 2,
                         "terminal_state": json.dumps({"trajectory": _TRAJECTORY}),
@@ -182,7 +208,7 @@ def test_baselines_shard_scenarios_and_run_fifty_unmodified_episodes(
                         "change_id": change_id,
                         "scenario_id": scenario_id,
                         "tier": tier,
-                        "seed": seed + i,
+                        "seed": kwargs["scenario"]["seeds"][i],
                         "success": True,
                         "steps": 400,
                         "terminal_state": "{}",
