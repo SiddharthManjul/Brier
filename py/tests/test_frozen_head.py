@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,16 +12,14 @@ from torch import nn
 
 _VALUES = {
     "regressed": ["no", "yes"],
-    "failure_mode": [
-        "none", "stall/timeout", "overshoot/misalignment",
-        "grasp or drop failure", "collision", "oscillation",
-    ],
+    "failure_mode": ["none", "stall/timeout", "overshoot/misalignment",
+                     "grasp or drop failure", "collision", "oscillation"],
     "success_bucket": ["1", "2", "3", "4", "5"],
 }
 _VERSION = "test/frozen-decoder@" + "a" * 40
 
 
-def _records():
+def _records() -> list[dict]:
     records = []
     for index, split in enumerate(("train", "calibration", "test", "ood"), 1):
         for question, values in _VALUES.items():
@@ -34,7 +33,7 @@ def _records():
     return records
 
 
-def _artifact(path):
+def _artifact(path: Path) -> dict:
     records = _records()
     payload = {
         "format": frozen._EMBEDDINGS, "model_version": _VERSION,
@@ -45,18 +44,16 @@ def _artifact(path):
     return payload
 
 
-def test_extract_embeddings_uses_verbatim_prompts_and_last_token(tmp_path, monkeypatch):
+@pytest.mark.parametrize("native, context", [(False, 1536), (True, 131072), (True, 2)])
+def test_extract_embeddings_uses_verbatim_prompts_and_last_token(tmp_path, monkeypatch, native, context):
     monkeypatch.setenv("BRIER_DATA", str(tmp_path))
     monkeypatch.setenv("MODAL_MODEL_ID", "test/frozen-decoder")
     monkeypatch.setenv("MODAL_MODEL_REVISION", "a" * 40)
-    rows = [{**row, "prompt": f"Rust fixture {index}\n"}
-            for index, row in enumerate(_records())]
+    prompt = "<system> Brier Ω\n<state>\ncompiled\n</state>\n<question> q\n<options> options\n<answer>"
+    rows = [{**row, "prompt": prompt} for row in _records()]
     compiled = tmp_path / "compiled.jsonl"
     compiled.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
-    validated, prompts = [], []
-    monkeypatch.setattr(
-        frozen, "load_training_data", lambda path: validated.append(path) or rows[:6]
-    )
+    prompts = []
 
     class Tokenizer:
         def __call__(self, prompt, *, add_special_tokens, return_tensors):
@@ -78,27 +75,46 @@ def test_extract_embeddings_uses_verbatim_prompts_and_last_token(tmp_path, monke
             hidden = torch.stack((input_ids, input_ids + 10), dim=-1).float()
             return SimpleNamespace(hidden_states=(hidden,))
 
-    config = SimpleNamespace(
-        is_encoder_decoder=False, vision_config=None, max_position_embeddings=1536
-    )
-    fake = SimpleNamespace(
-        AutoConfig=SimpleNamespace(from_pretrained=lambda *args, **kwargs: config),
-        AutoTokenizer=SimpleNamespace(from_pretrained=lambda *args, **kwargs: Tokenizer()),
-        AutoModelForCausalLM=SimpleNamespace(
-            from_pretrained=lambda *args, **kwargs: Model()
-        ),
-    )
-    monkeypatch.setitem(sys.modules, "transformers", fake)
+    config = SimpleNamespace(is_encoder_decoder=False, vision_config=None, max_position_embeddings=context)
+    if native:
+        config = SimpleNamespace(model_type="muse_glimmer", architectures=["MuseGlimmerForConditionalGeneration"],
+            vision_config=SimpleNamespace(model_type="muse_glimmer_vision"),
+            text_config=SimpleNamespace(model_type="muse_glimmer_text", max_position_embeddings=context))
+
+    def load_model(identifier, **kwargs):
+        assert identifier == "test/frozen-decoder" and kwargs["revision"] == "a" * 40
+        assert kwargs["config"] is config and not kwargs["trust_remote_code"]
+        assert kwargs["dtype"] == torch.bfloat16
+        return Model()
+
+    def wrong_loader(*args, **kwargs):
+        pytest.fail("frozen extraction selected the wrong Transformers model class")
+
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(
+        AutoConfig=SimpleNamespace(from_pretrained=lambda *a, **kw: config),
+        AutoTokenizer=SimpleNamespace(from_pretrained=lambda *a, **kw: Tokenizer()),
+        AutoModelForCausalLM=SimpleNamespace(from_pretrained=wrong_loader if native else load_model),
+        MuseGlimmerForConditionalGeneration=SimpleNamespace(from_pretrained=load_model if native else wrong_loader),
+    ))
     out = tmp_path / "embeddings.pt"
+    if context == 2:
+        with pytest.raises(ValueError, match="model input limit"):
+            frozen.extract_embeddings(compiled, out)
+        assert not out.exists()
+        return
     assert frozen.extract_embeddings(compiled, out) == out
+    assert not config.use_cache and (not native or not config.text_config.use_cache)
     payload = torch.load(out, weights_only=True)
-    assert validated == [compiled]
     assert prompts == [row["prompt"] for row in rows]
     assert payload["embeddings"][0].tolist() == [2.0, 12.0]
     assert payload["embeddings"].shape == (24, 2)
     assert all("prompt" not in row for row in payload["records"])
     with pytest.raises(FileExistsError):
         frozen.extract_embeddings(compiled, out)
+    rows[-1]["split"] = "train"
+    compiled.write_text("\n".join(json.dumps(row) for row in rows))
+    with pytest.raises(ValueError, match="multiple splits"):
+        frozen.extract_embeddings(compiled, tmp_path / "invalid.pt")
 
 
 def test_train_head_ignores_heldout_labels_reproducibly(tmp_path, monkeypatch):
@@ -122,8 +138,7 @@ def test_train_head_ignores_heldout_labels_reproducibly(tmp_path, monkeypatch):
     left, right = (torch.load(path, weights_only=True) for path in (first, second))
     assert set(calls) == set(_VALUES)
     assert left["values"] == _VALUES
-    assert all(torch.equal(value, right["state_dict"][key])
-               for key, value in left["state_dict"].items())
+    assert all(torch.equal(value, right["state_dict"][key]) for key, value in left["state_dict"].items())
     predicted = frozen.predict_head(source, first)
     assert all(predicted[row["id"]]["A"] > 1 / len(row["options"])
                for row in payload["records"] if row["split"] == "train")
@@ -139,11 +154,9 @@ def test_predict_head_maps_shuffled_letters_to_semantics(tmp_path, monkeypatch):
             for parameter in head.parameters():
                 parameter.zero_()
             head[-1].bias.copy_(torch.arange(head[-1].out_features).float())
-    torch.save({
-        "format": frozen._HEAD, "dimension": 2, "values": _VALUES,
-        "state_dict": heads.state_dict(), "model_version": _VERSION,
-        "source_sha256": "b" * 64,
-    }, checkpoint)
+    torch.save({"format": frozen._HEAD, "dimension": 2, "values": _VALUES,
+                "state_dict": heads.state_dict(), "model_version": _VERSION,
+                "source_sha256": "b" * 64}, checkpoint)
     before = frozen.predict_head(source, checkpoint)
     row = payload["records"][0]
     row["options"], row["label"] = {"A": "yes", "B": "no"}, "B"
