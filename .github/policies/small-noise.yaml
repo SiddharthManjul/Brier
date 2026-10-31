@@ -1,0 +1,15 @@
+# Set the actual checkpoint revision. Evaluate it to determine the outcome.
+env: gym_pusht/PushT-v0
+policy:
+  id: lerobot/diffusion_pusht
+  revision: null
+description: Add observation noise and reduce action scale
+families:
+  - family: obs_noise
+    params:
+      sigma: 0.01
+  - family: action_scale
+    params:
+      scale: 0.99
+logging:
+  level: info
