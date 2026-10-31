@@ -526,9 +526,11 @@ def _run(env: str, phase: str, shard: int, n_shards: int, procs: int, max_hours:
     if phase == "pilot" and _missing(env, groups[:1]):
         if shard != 0:
             raise ValueError("pilot requires all four matched base keys; run shard 0 first")
-        _group((env, groups[0], deadline))
+        stopped = _group((env, groups[0], deadline))
         if _missing(env, groups[:1]):
-            return 3
+            if stopped:
+                return 3
+            raise RuntimeError("pilot bootstrap returned with missing base keys")
     if _missing(env, assigned):
         with ProcessPoolExecutor(max_workers=procs, mp_context=get_context("spawn")) as pool:
             stopped = any(list(pool.map(_group, [(env, keys, deadline) for keys in assigned])))
