@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
 
 import numpy as np
 import pytest
-from brier_ml.dataset import FEATURE_NAMES, load_dataset
+from brier_ml.dataset import FEATURE_NAMES, _change_features, load_dataset
 from brier_ml.t1 import predict_t1, train_t1
 
 
@@ -196,3 +197,119 @@ def test_predict_rejects_nonfinite_features_and_bad_knots(dataset_files: tuple[P
     artifact["isotonic"]["y"] = [0, 1]
     with pytest.raises(ValueError, match="isotonic knots"):
         predict_t1(artifact, dataset["features"])
+
+
+def _guide_files(files: tuple[Path, Path]) -> tuple[Path, Path]:
+    ledger, compiled = files
+    rows = [json.loads(line) for line in compiled.read_text().splitlines()]
+    with sqlite3.connect(ledger) as connection:
+        connection.execute("UPDATE scenarios SET params_json = ?", (json.dumps({
+            "pose_bin": 1, "lighting": "normal", "camera_jitter": False}),))
+        for index, row in enumerate(rows):
+            old, change = row["id"].split("/")[0], f"c{index + 101:03d}"
+            for table in ("changes", "labels", "runs"):
+                connection.execute(f"UPDATE {table} SET change_id = ? WHERE change_id = ?", (change, old))
+            card = json.loads(connection.execute("SELECT card_json FROM changes WHERE change_id = ?", (change,)).fetchone()[0])
+            card = {"change_id": change, "env": "pusht", "families": card["families"], "desc": card["description"], "seed": 1}
+            if index == len(rows) - 1:
+                card["families"] = [{"family": "occlusion", "params": {"fraction": .2}}]
+            connection.execute("UPDATE changes SET card_json = ? WHERE change_id = ?", (json.dumps(card), change))
+            bucket = int.from_bytes(hashlib.sha256(change.encode()).digest()[:4], "big") % 10
+            split = "train" if bucket < 6 else "calibration" if bucket < 8 else "test"
+            rows[index] = {"id": f"{change}:pusht-s01:regressed:ev", "pair_id": f"{change}:pusht-s01",
+                           "change_id": change, "scenario_id": "pusht-s01", "env": "pusht", "variant": "ev",
+                           "split": "ood" if index == len(rows) - 1 else split, "question": "regressed",
+                           "options": ["yes", "no"], "label": "A" if row["label"] == "B" else "B",
+                           "prompt": "<system> exact\n<state>\nx\n</state>\n<question> exact\n<options> A) yes  B) no\n<answer>"}
+    compiled.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    return ledger, compiled
+
+
+def test_guide_dataset_keeps_ids_pose_and_training_history(dataset_files: tuple[Path, Path]) -> None:
+    dataset = load_dataset(*_guide_files(dataset_files))
+    assert dataset["ids"][0] == "c101:pusht-s01:regressed:ev"
+    assert dataset["features"].shape == (15, len(FEATURE_NAMES))
+    assert dataset["features"][:, FEATURE_NAMES.index("pose_bin")].tolist() == [0.] * 15
+    assert dataset["features"][-1, FEATURE_NAMES.index("occlusion_width")] == .2
+    train = [i for i, split in enumerate(dataset["splits"]) if split == "train"][:2]
+    ledger, compiled = dataset_files
+    rows = [json.loads(line) for line in compiled.read_text().splitlines()]
+    rows = [row for i, row in enumerate(rows) if row["split"] != "train" or i in train]
+    compiled.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    smaller = load_dataset(ledger, compiled)
+    assert len(smaller["ids"]) == len(rows)
+    for index, row in enumerate(rows):
+        targets = [i % 2 for i in train if f"c{i + 101:03d}" != row["change_id"]]
+        assert smaller["features"][index, -1] == pytest.approx(np.mean(targets))
+
+
+@pytest.mark.parametrize("family,params,expected", [
+    ("action_scale", {"s": .8}, {"action_scale_scale": .2}),
+    ("action_bias", {"b": 2}, {"action_bias_drift": 2}),
+    ("camera_shift", {"shift": 4, "angle": 3}, {"camera_shift_dx": 4, "camera_shift_dy": 4, "camera_shift_angle": 3}),
+    ("occlusion", {"fraction": .2}, {"occlusion_x": 0, "occlusion_y": 0, "occlusion_width": .2, "occlusion_height": .2}),
+])
+def test_guide_feature_aliases_leave_original_card_unchanged(family, params, expected) -> None:
+    card = {"change_id": "c001", "env": "pusht", "families": [{"family": family, "params": params}], "desc": "change", "seed": 1}
+    before = json.dumps(card)
+    features = dict(zip(FEATURE_NAMES, _change_features(card)))
+    for key, value in expected.items():
+        assert features[key] == pytest.approx(value)
+    assert json.dumps(card) == before
+
+
+@pytest.mark.parametrize("field,value", [("pair_id", "c999:pusht-s01"), ("env", "aloha"),
+    ("scenario_id", "pusht-s02"), ("variant", "noev"), ("split", "ood"),
+    ("options", ["yes", "yes"]), ("label", "F"), ("prompt", "invented<answer>")])
+def test_guide_dataset_rejects_invalid_provenance_and_contract(dataset_files, field, value) -> None:
+    ledger, compiled = _guide_files(dataset_files)
+    rows = [json.loads(line) for line in compiled.read_text().splitlines()]
+    rows[0][field] = value
+    compiled.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    with pytest.raises(ValueError):
+        load_dataset(ledger, compiled)
+
+
+def test_guide_history_ranks_family_jaccard_before_magnitude(dataset_files) -> None:
+    ledger, compiled = _guide_files(dataset_files)
+    rows = [json.loads(line) for line in compiled.read_text().splitlines()]
+    training = [row for row in rows if row["split"] == "train"]
+    with sqlite3.connect(ledger) as connection:
+        for row in training[:3]:
+            card = {"change_id": row["change_id"], "env": "pusht", "desc": "change", "seed": 1,
+                    "families": [{"family": "action_latency", "params": {"k": 1}}]}
+            connection.execute("UPDATE changes SET card_json = ? WHERE change_id = ?", (json.dumps(card), row["change_id"]))
+    dataset = load_dataset(ledger, compiled)
+    target = next(i for i, row in enumerate(rows) if row["split"] == "calibration")
+    neighbors = [i for i, row in enumerate(rows) if row in training[3:]]
+    assert len(neighbors) == 5
+    assert dataset["features"][target, -1] == pytest.approx(dataset["labels"][neighbors].mean())
+    heldout = [row for row in rows if row["split"] != "train"]
+    compiled.write_text("".join(json.dumps(row) + "\n" for row in heldout))
+    with pytest.raises(ValueError, match="one other training change"):
+        load_dataset(ledger, compiled)
+
+
+def test_new_container_preserves_legacy_aloha_ledger_ids_cards_and_pose(dataset_files) -> None:
+    ledger, compiled = _guide_files(dataset_files)
+    rows = [json.loads(line) for line in compiled.read_text().splitlines()]
+    with sqlite3.connect(ledger) as connection:
+        connection.execute("UPDATE scenarios SET scenario_id = 'aloha_transfer_cube-s01', env = 'gym_aloha/AlohaTransferCube-v0', params_json = ?",
+                           (json.dumps({"pose_bin": 0, "lighting": "normal", "camera_jitter": False, "physics_jitter": False}),))
+        connection.execute("UPDATE labels SET scenario_id = 'aloha_transfer_cube-s01'")
+        connection.execute("UPDATE runs SET scenario_id = 'aloha_transfer_cube-s01'")
+        for row in rows:
+            card = json.loads(connection.execute("SELECT card_json FROM changes WHERE change_id = ?", (row["change_id"],)).fetchone()[0])
+            if row["split"] == "ood":
+                card["families"] = [{"family": "occlusion", "params": {"x": 0, "y": 0, "width": 10, "height": 10}}]
+            old = {"description": card["desc"], "families": card["families"]}
+            connection.execute("UPDATE changes SET env = 'gym_aloha/AlohaTransferCube-v0', card_json = ? WHERE change_id = ?",
+                               (json.dumps(old), row["change_id"]))
+            row.update(id=row["id"].replace("pusht-s01", "aloha_transfer_cube-s01"),
+                       pair_id=row["pair_id"].replace("pusht-s01", "aloha_transfer_cube-s01"),
+                       scenario_id="aloha_transfer_cube-s01", env="aloha")
+    compiled.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    dataset = load_dataset(ledger, compiled)
+    assert dataset["ids"][0] == "c101:aloha_transfer_cube-s01:regressed:ev"
+    assert dataset["features"][:, FEATURE_NAMES.index("env_is_aloha")].tolist() == [1.] * 15
+    assert dataset["features"][:, FEATURE_NAMES.index("pose_bin")].tolist() == [0.] * 15
