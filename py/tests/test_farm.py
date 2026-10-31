@@ -2,7 +2,6 @@ import json
 import os
 import shlex
 import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -388,22 +387,17 @@ def test_failed_download_preserves_cache_and_removes_partial_file(
     assert list(tmp_path.iterdir()) == [cache]
 
 
-def test_spot_worker_fails_before_installing_when_native_library_is_missing(
-    tmp_path: Path,
-) -> None:
-    for name, command in [("uname", "echo Linux"), ("gcloud", "exit 0")]:
-        path = tmp_path / name
-        path.write_text(f"#!/bin/sh\n{command}\n")
-        path.chmod(0o755)
-    wrapper = tmp_path / "python3.11"
-    code = "import ctypes.util,sys; ctypes.util.find_library=lambda name:None; exec(sys.stdin.read())"
-    wrapper.write_text(
-        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(code)}\n"
+def test_spot_invalid_shard_range_stops_before_cloud_calls(tmp_path: Path) -> None:
+    marker = tmp_path / "cloud-called"
+    gcloud = tmp_path / "gcloud"
+    gcloud.write_text(
+        f"#!/bin/sh\nprintf called > {shlex.quote(str(marker))}\nexit 99\n"
     )
-    wrapper.chmod(0o755)
+    gcloud.chmod(0o755)
     repository = Path(farm.__file__).resolve().parents[2]
     result = subprocess.run(
-        ["bash", str(repository / "py/brier_sim/gcp_spot.sh"), "pusht", "0", "1"],
+        ["bash", str(repository / "py/brier_sim/gcp_spot.sh"),
+         "up", "pusht", "pilot", "1", "2", "2"],
         check=False,
         cwd=repository,
         capture_output=True,
@@ -411,8 +405,10 @@ def test_spot_worker_fails_before_installing_when_native_library_is_missing(
         env={
             **os.environ,
             "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+            "GCP_PROJECT": "example-project",
             "BRIER_DATA": "gs://brier-test/rollouts",
         },
     )
-    assert result.returncode != 0
-    assert "Missing native EGL library" in result.stderr
+    assert result.returncode == 2
+    assert "first_shard + n_vms <= n_shards" in result.stderr
+    assert not marker.exists()
