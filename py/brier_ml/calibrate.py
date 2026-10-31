@@ -8,7 +8,6 @@ import numpy as np
 
 from brier_ml.evaluate import binary_metrics
 
-_QUESTIONS = ("regressed", "failure_mode", "success_bucket")
 _SEMANTICS = {
     "regressed": {"yes", "no"},
     "failure_mode": {"none", "stall/timeout", "overshoot/misalignment",
@@ -17,25 +16,22 @@ _SEMANTICS = {
 }
 _SPLITS = {"train", "calibration", "test", "ood"}
 _ID = re.compile(
-    r"(c[0-9]{3})/[^/]+/(regressed|failure_mode|success_bucket)/(cheap|no_cheap)"
+    r"(c[0-9]{3,})/(?:pusht|aloha_transfer_cube)-s([0-9]{2,})/"
+    r"(regressed|failure_mode|success_bucket)/(cheap|no_cheap)"
 )
 _Sample = tuple[tuple[float, ...], int, int]
 
 
 def _distribution(probabilities: dict[str, float]) -> tuple[list[str], tuple[float, ...]]:
     if (
-        not isinstance(probabilities, dict)
-        or len(probabilities) < 2
+        not isinstance(probabilities, dict) or len(probabilities) < 2
         or any(not isinstance(key, str) or not key for key in probabilities)
     ):
         raise ValueError("probabilities must map at least two option letters to numbers")
     values = tuple(probabilities.values())
     if any(
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not 0 < value <= 1
-        or not math.isfinite(value)
-        for value in values
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        or not 0 < value <= 1 or not math.isfinite(value) for value in values
     ):
         raise ValueError("option probabilities must be finite and strictly positive")
     if not math.isclose(math.fsum(values), 1.0, rel_tol=1e-7, abs_tol=1e-8):
@@ -54,10 +50,8 @@ def _scale(values: tuple[float, ...], temperature: float) -> tuple[float, ...]:
 def apply_temperature(probabilities: dict[str, float], temperature: float) -> dict[str, float]:
     """Scale positive, normalized option probabilities without changing their keys."""
     if (
-        isinstance(temperature, bool)
-        or not isinstance(temperature, (int, float))
-        or not math.isfinite(temperature)
-        or temperature <= 0
+        isinstance(temperature, bool) or not isinstance(temperature, (int, float))
+        or not 0 < temperature < math.inf
     ):
         raise ValueError("temperature must be a finite positive number")
     keys, values = _distribution(probabilities)
@@ -102,15 +96,15 @@ def _metrics(question: str, samples: list[_Sample], temperature: float) -> dict[
 
 
 def fit_temperatures(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Fit three temperatures on calibration rows only within bounds [0.05, 20].
+    """Fit one temperature per question on calibration rows within [0.05, 20].
 
-    Scored compiled rows supply id, split, question, options, label, probabilities.
-    Reported metrics use calibration rows only; multiclass Brier sums over options.
+    Scored compiled rows require id, split, question, options, label, probabilities.
+    Returned metrics describe calibration rows only; multiclass Brier sums options.
     """
     if not isinstance(records, list) or not records:
         raise ValueError("records must be a nonempty list of scored compiled rows")
     required = {"id", "split", "question", "options", "label", "probabilities"}
-    groups: dict[str, list[_Sample]] = {question: [] for question in _QUESTIONS}
+    groups: dict[str, list[_Sample]] = {question: [] for question in _SEMANTICS}
     seen: set[str] = set()
     change_splits: dict[str, str] = {}
     for record in records:
@@ -118,7 +112,10 @@ def fit_temperatures(records: list[dict[str, Any]]) -> dict[str, Any]:
             raise ValueError("each scored row must contain all required fields")
         identifier = record["id"]
         match = _ID.fullmatch(identifier) if isinstance(identifier, str) else None
-        if match is None or match.group(2) != record["question"]:
+        if (
+            match is None or match.group(3) != record["question"]
+            or int(match.group(1)[1:]) == 0 or int(match.group(2)) == 0
+        ):
             raise ValueError("row id must match its question and compiled id format")
         if identifier in seen:
             raise ValueError(f"duplicate scored row: {identifier}")
@@ -132,8 +129,7 @@ def fit_temperatures(records: list[dict[str, Any]]) -> dict[str, Any]:
         change_splits[change] = split
         options = record["options"]
         if (
-            not isinstance(options, dict)
-            or not 2 <= len(options) <= 26
+            not isinstance(options, dict) or not 2 <= len(options) <= 26
             or any(not isinstance(key, str) for key in options)
             or sorted(options) != [chr(65 + index) for index in range(len(options))]
             or any(not isinstance(value, str) or not value for value in options.values())
@@ -146,12 +142,12 @@ def fit_temperatures(records: list[dict[str, Any]]) -> dict[str, Any]:
         label = record["label"]
         if not isinstance(label, str) or label not in options:
             raise ValueError("label must be one of the supplied option letters")
-        keys, values = _distribution(record["probabilities"])
+        keys, _ = _distribution(record["probabilities"])
         if set(keys) != set(options):
             raise ValueError("probability keys must exactly match option letters")
-        yes = -1
-        if question == "regressed":
-            yes = next(index for index, key in enumerate(keys) if options[key] == "yes")
+        keys = sorted(options, key=options.__getitem__)
+        values = tuple(float(record["probabilities"][key]) for key in keys)
+        yes = next((i for i, key in enumerate(keys) if options[key] == "yes"), -1)
         if split == "calibration":
             groups[question].append((values, keys.index(label), yes))
     if any(not samples for samples in groups.values()):
@@ -161,10 +157,8 @@ def fit_temperatures(records: list[dict[str, Any]]) -> dict[str, Any]:
     ratio = (math.sqrt(5) - 1) / 2
     for question, samples in groups.items():
         lower, upper = math.log(0.05), math.log(20.0)
-        left = upper - ratio * (upper - lower)
-        right = lower + ratio * (upper - lower)
-        left_loss = _loss(samples, math.exp(left))
-        right_loss = _loss(samples, math.exp(right))
+        left, right = upper - ratio * (upper - lower), lower + ratio * (upper - lower)
+        left_loss, right_loss = _loss(samples, math.exp(left)), _loss(samples, math.exp(right))
         for _ in range(80):
             if left_loss <= right_loss:
                 upper, right, right_loss = right, left, left_loss
@@ -178,8 +172,7 @@ def fit_temperatures(records: list[dict[str, Any]]) -> dict[str, Any]:
         temperature = min(candidates, key=lambda value: _loss(samples, value))
         temperatures[question] = temperature
         reports[question] = {
-            "count": len(samples),
-            "before": _metrics(question, samples, 1.0),
+            "count": len(samples), "before": _metrics(question, samples, 1.0),
             "after": _metrics(question, samples, temperature),
         }
     return {"temperatures": temperatures, "calibration": reports}
