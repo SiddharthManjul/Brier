@@ -295,6 +295,14 @@ def test_pilot_shard_zero_bootstraps_only_four_base_keys_and_other_shards_refuse
     assert not (manifests["root"] / "manifests/magnitudes_pusht.json").exists()
 
 
+def test_missing_pilot_bootstrap_work_without_deadline_stop_is_an_error(
+    manifests: dict, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(farm, "run_key", lambda *args: ([], []))
+    with pytest.raises(RuntimeError, match="bootstrap returned with missing base keys"):
+        farm._run("pusht", "pilot", 0, 44, 3)
+
+
 def _pilot_rows(env: str, key: tuple, successes: int) -> list[dict]:
     change, scenario, tier = key
     return [{"env": env, "change_id": "base" if change is None else change["change_id"],
