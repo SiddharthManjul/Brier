@@ -1,51 +1,90 @@
 name: Rollouts
-
 on:
   workflow_dispatch:
     inputs:
-      baseline:
-        description: Run the once-per-scenario 50-episode baselines
-        type: boolean
-        default: false
-
-permissions:
-  contents: read
-  id-token: write
-
-concurrency:
-  group: brier-rollouts
-  cancel-in-progress: false
-
+      env: {description: Environment, type: choice, options: [pusht, aloha], required: true}
+      phase: {description: Phase, type: choice, options: [timing, baselines, pairs, pilot], required: true}
+      n_shards: {description: Total shards, type: number, default: 40}
+      shard_offset: {description: First shard, type: number, default: 0}
+      shard_count: {description: Shards in this dispatch, type: number, default: 20}
+permissions: {contents: read, id-token: write}
+concurrency: {group: brier-rollouts, cancel-in-progress: false}
+env:
+  BRIER_DATA: ${{ vars.BRIER_DATA }}
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  MUJOCO_GL: osmesa
+  PYOPENGL_PLATFORM: osmesa
+  SDL_VIDEODRIVER: dummy
+  OMP_NUM_THREADS: '1'
+  MKL_NUM_THREADS: '1'
 jobs:
-  rollouts:
+  setup:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
+    outputs: {shards: '${{ steps.plan.outputs.shards }}'}
+    steps:
+      - id: plan
+        env: {N: '${{ inputs.n_shards }}', OFFSET: '${{ inputs.shard_offset }}', COUNT: '${{ inputs.shard_count }}', PHASE: '${{ inputs.phase }}'}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          n, offset, count = (int(os.environ[k]) for k in ('N', 'OFFSET', 'COUNT'))
+          assert n > 0 and 0 <= offset < n and 1 <= count <= 20 and offset + count <= n, 'Invalid shard range'
+          assert os.environ['PHASE'] != 'timing' or (n, offset, count) == (1, 0, 1), 'Timing needs one shard'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('shards=' + json.dumps(list(range(offset, offset + count))) + '\n')
+          PY
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - uses: actions/cache@v4
+        if: inputs.phase == 'pilot'
+        with: {path: ~/.cache/huggingface, key: 'rollouts-hf-${{ runner.os }}-${{ hashFiles(''py/brier_sim/pins.json'') }}'}
+      - uses: google-github-actions/auth@v2
+        if: inputs.phase == 'pilot'
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      - name: Complete pilot baselines before parallel shards
+        if: inputs.phase == 'pilot'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libosmesa6-dev libgl1 libglib2.0-0 ffmpeg
+          python -m pip install uv
+          uv pip install --system torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system -e .
+          python -m brier_sim.farm run --env '${{ inputs.env }}' --phase pilot --shard 0 --n-shards 44 --procs 4 --max-hours 5.5
+  rollouts:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
     strategy:
       fail-fast: false
       max-parallel: 20
-      matrix:
-        env: [pusht, aloha_transfer_cube]
-        shard: [0, 1, 2, 3]
-    env:
-      BRIER_DATA: ${{ vars.BRIER_DATA }}
-      MUJOCO_GL: egl
-      PYOPENGL_PLATFORM: egl
-      HF_HUB_DISABLE_XET: '1'
+      matrix: {shard: '${{ fromJSON(needs.setup.outputs.shards) }}'}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+        with: {python-version: '3.11'}
+      - uses: actions/cache@v4
+        with: {path: ~/.cache/huggingface, key: 'rollouts-hf-${{ runner.os }}-${{ hashFiles(''py/brier_sim/pins.json'') }}'}
       - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
-      - uses: google-github-actions/setup-gcloud@v2
-      - name: Install simulation dependencies
+      - name: Install CPU simulation dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1 libgles2 libopengl0
-          pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
-          pip install -e .
-      - name: Run change shard
-        run: python -m brier_sim.farm --env '${{ matrix.env }}' --shard '${{ matrix.shard }}' --shards 4 ${{ inputs.baseline && '--baseline' || '' }}
+          sudo apt-get install -y libosmesa6-dev libgl1 libglib2.0-0 ffmpeg
+          python -m pip install uv
+          uv pip install --system torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system -e .
+      - name: Run assigned work
+        run: |
+          if [ '${{ inputs.phase }}' = timing ]; then
+            python -m brier_sim.farm timing --env '${{ inputs.env }}'
+          else
+            status=0
+            python -m brier_sim.farm run --env '${{ inputs.env }}' --phase '${{ inputs.phase }}' --shard '${{ matrix.shard }}' --n-shards '${{ inputs.n_shards }}' --procs 4 --max-hours 5.5 || status=$?
+            [ "$status" -eq 0 ] || [ "$status" -eq 3 ]
+          fi
