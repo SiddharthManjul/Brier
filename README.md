@@ -2,7 +2,7 @@
 
 Brier predicts which robot evaluation scenarios will regress after a policy change, then selects expensive simulation runs under a calibrated risk policy.
 
-**Status:** the ungated Robot CI and platform code is implemented locally. `make check` passes: 95 Rust tests, 417 Python tests, 11 web tests, formatting, lint, type checking, and the production build. Guide 1 rollout-data work is in progress: D1–D4 passed local acceptance checks, and D5 benchmark code and tests passed local checks. There is no measured performance headline, published evaluation dataset, released adapter, deployed service, or recorded end-to-end demo yet. Passing local checks does not establish that a trained model saves evaluation hours.
+**Status:** the ungated Robot CI and platform code is implemented locally. Local checks pass: 114 Rust tests, 443 Python tests, 11 web tests, formatting, lint, type checking, and the production build. Guide 1's rollout, aggregation, label and prompt code is implemented; real GitHub timing is in progress, and collection and dataset quality gates remain pending. Guide 2 training code is in progress. There is no measured performance headline, published evaluation dataset, released adapter, deployed service, or recorded end-to-end demo yet. Passing local checks does not establish that a trained model saves evaluation hours.
 
 Repository: [SiddharthManjul/Brier](https://github.com/SiddharthManjul/Brier). The [build plan](<Brier Build Plan (Robot CI first, Software CI second).md>), [scope](SCOPE.md), and [task rules](AGENTS.md) define the boundaries.
 
