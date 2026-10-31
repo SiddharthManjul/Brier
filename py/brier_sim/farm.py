@@ -10,6 +10,10 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor
+from copy import deepcopy
+from io import BytesIO
+from multiprocessing import get_context
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
@@ -19,7 +23,8 @@ import pyarrow.parquet as pq
 import torch
 
 from brier_sim import envs, storage
-from brier_sim.runner import _SCHEMA, _guide_episode, run_episodes
+from brier_sim.changes import _grid
+from brier_sim.runner import _SCHEMA, _guide_episode, run_episodes, run_key
 from brier_sim.scenarios import build_scenarios, scenarios
 
 _ENVS = {
@@ -410,7 +415,148 @@ def _timing_cli(arguments: list[str]) -> bool:
     return True
 
 
-if __name__ == "__main__" and not _timing_cli(sys.argv[1:]):
+def _read(uri: str) -> bytes:
+    location = storage._location(uri)
+    return location.read_bytes() if isinstance(location, Path) else storage._blob(location).download_as_bytes(retry=None)
+
+
+def _guide_plan(env: str, phase: str) -> list[list[tuple]]:
+    if env not in ("pusht", "aloha") or phase not in ("baselines", "pairs", "pilot"):
+        raise ValueError("run requires a supported env and phase")
+    root = _timing_root()
+    definitions = json.loads(_read(f"{root}/manifests/scenarios_{env}.json"))
+    if not isinstance(definitions, list) or any(not isinstance(item, dict) or not isinstance(item.get("scenario_id"), str) for item in definitions):
+        raise ValueError("scenario manifest must contain the frozen 16 scenarios")
+    definitions.sort(key=lambda item: item.get("scenario_id", ""))
+    if json.dumps(definitions, sort_keys=True) != json.dumps(build_scenarios(env), sort_keys=True):
+        raise ValueError("scenario manifest must match the frozen 16 scenarios and seeds")
+    if phase == "baselines":
+        return [[(None, scenario, "baseline")] for scenario in definitions]
+    if phase == "pilot":
+        definitions = deepcopy(definitions[::4])
+        for scenario in definitions:
+            scenario["params"].update(lighting="normal", camera_jitter=False)
+            if "physics_jitter" in scenario["params"]:
+                scenario["params"]["physics_jitter"] = False
+            scenario["seeds"] = scenario["seeds"][:10]
+        # Provisional IDs never overlap the production c001..c160 library.
+        cards = [None] + [{"change_id": f"c{index:03}", "env": env, "families": [{"family": family, "params": params}],
+                          "desc": f"Pilot {family}: {json.dumps(params, sort_keys=True)}", "seed": 2026 + index}
+                         for index, (family, params) in enumerate(((family, params) for family, values in sorted(_grid(env).items())
+                                                                  for params in values), 1001 if env == "pusht" else 2001)]
+        _LOG.info("Pilot %s: %d keys, %d episodes", env, len(cards) * 4, len(cards) * 40)
+        return [[(card, scenario, "pilot") for scenario in definitions] for card in cards]
+    if any(not storage.exists(storage.key_uri(env, "base", scenario["scenario_id"], "baseline")) for scenario in definitions):
+        raise ValueError("pairs require all 16 completed baseline keys")
+    sizing = json.loads(_read(f"{root}/manifests/sizing.json"))
+    selected = sizing["environments"][env]
+    if (sizing.get("pins_sha256") != hashlib.sha256(Path(__file__).with_name("pins.json").read_bytes()).hexdigest()
+            or type(selected.get("changes")) is not int or not 40 <= selected["changes"] <= 80 or selected["changes"] % 4
+            or type(selected.get("scenarios")) is not int or selected["scenarios"] not in (12, 16)):
+        raise ValueError("sizing requires current pins, a supported change count, and 12 or 16 scenarios")
+    cards = [json.loads(line) for line in _read(f"{root}/manifests/changes_{env}.jsonl").decode().splitlines() if line.strip()]
+    expected = {f"c{index:03}" for index in range(1 if env == "pusht" else 81, (1 if env == "pusht" else 81) + selected["changes"])}
+    if (len(cards) != selected["changes"] or any(not isinstance(card, dict) or card.get("env") != env
+            or not isinstance(card.get("change_id"), str) for card in cards)
+            or {card.get("change_id") for card in cards} != expected):
+        raise ValueError("change manifest must match the sizing count, environment and unique production IDs")
+    return [[(card, scenario, tier) for scenario in definitions[:selected["scenarios"]] for tier in ("cheap", "expensive")]
+            for card in sorted(cards, key=lambda item: item["change_id"])]
+
+
+def _group(task: tuple) -> bool:
+    env, keys, deadline = task
+    logging.basicConfig(level=logging.INFO)
+    cache: dict = {}
+    try:
+        for change, scenario, tier in keys:
+            uri = storage.key_uri(env, "base" if change is None else change["change_id"], scenario["scenario_id"], tier)
+            if storage.exists(uri):
+                continue
+            if time.monotonic() >= deadline:
+                return True
+            started = time.perf_counter()
+            rows, _ = run_key(env, change, scenario, tier, cache)
+            _LOG.info("Completed %s successes=%d n=%d wall_seconds=%.3f", uri, sum(row["success"] for row in rows), len(rows), time.perf_counter() - started)
+    finally:
+        for vector, _, _ in cache.values():
+            vector.close()
+    return False
+
+
+def _missing(env: str, groups: list[list[tuple]]) -> bool:
+    return any(not storage.exists(storage.key_uri(env, "base" if change is None else change["change_id"], scenario["scenario_id"], tier))
+               for keys in groups for change, scenario, tier in keys)
+
+
+def _pilot_magnitudes(env: str, groups: list[list[tuple]]) -> None:
+    if _missing(env, groups):
+        return
+    def successes(key: tuple) -> int:
+        change, scenario, tier = key
+        change_id = "base" if change is None else change["change_id"]
+        rows = pq.ParquetFile(BytesIO(_read(storage.key_uri(env, change_id, scenario["scenario_id"], tier)))).read().to_pylist()
+        if (len(rows) != 10 or [row.get("seed") for row in rows] != scenario["seeds"]
+                or any(row.get("env") != env or row.get("change_id") != change_id or row.get("scenario_id") != scenario["scenario_id"]
+                       or row.get("tier") != "pilot" or type(row.get("success")) is not bool for row in rows)):
+            raise ValueError("pilot rows must have ten matched seeds and correct key identities")
+        return sum(row["success"] for row in rows)
+    baseline, result = sum(successes(key) for key in groups[0]), {}
+    for keys in groups[1:]:
+        drop = baseline - sum(successes(key) for key in keys)
+        family = keys[0][0]["families"][0]
+        if 2 <= drop <= 24:
+            result.setdefault(family["family"], []).append({"params": family["params"], "mean_drop": drop / 40})
+    _LOG.info("Pilot %s dropped families without retained magnitudes: %s", env, sorted(set(_grid(env)) - set(result)))
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "magnitudes.json"
+        source.write_text(json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n")
+        storage._publish(source, f"{_timing_root()}/manifests/magnitudes_{env}.json", reuse=True)
+
+
+def _run(env: str, phase: str, shard: int, n_shards: int, procs: int, max_hours: float | None = None) -> int:
+    started = time.monotonic()
+    if (type(n_shards) is not int or n_shards < 1 or type(shard) is not int or not 0 <= shard < n_shards
+            or type(procs) is not int or procs < 1 or max_hours is not None and
+            (type(max_hours) not in (int, float) or not 0 < max_hours <= sys.float_info.max / 3600)):
+        raise ValueError("shard, n-shards, procs and max-hours must be valid positive finite values")
+    deadline = started + max_hours * 3600 if max_hours is not None else float("inf")
+    groups = _guide_plan(env, phase)
+    assigned = groups[shard::n_shards]
+    if phase == "pilot" and _missing(env, groups[:1]):
+        if shard != 0:
+            raise ValueError("pilot requires all four matched base keys; run shard 0 first")
+        _group((env, groups[0], deadline))
+        if _missing(env, groups[:1]):
+            return 3
+    if _missing(env, assigned):
+        with ProcessPoolExecutor(max_workers=procs, mp_context=get_context("spawn")) as pool:
+            stopped = any(list(pool.map(_group, [(env, keys, deadline) for keys in assigned])))
+        if _missing(env, assigned):
+            if stopped:
+                return 3
+            raise RuntimeError("rollout workers returned with missing assigned keys")
+    if phase == "pilot":
+        _pilot_magnitudes(env, groups)
+    return 0
+
+
+def _run_cli(arguments: list[str]) -> bool:
+    if not arguments or arguments[0] != "run":
+        return False
+    parser = argparse.ArgumentParser(prog=f"{__package__}.farm run")
+    parser.add_argument("--env", required=True, choices=("pusht", "aloha"))
+    parser.add_argument("--phase", required=True, choices=("baselines", "pairs", "pilot"))
+    parser.add_argument("--shard", required=True, type=int)
+    parser.add_argument("--n-shards", required=True, type=int)
+    parser.add_argument("--procs", required=True, type=int)
+    parser.add_argument("--max-hours", type=float)
+    args = parser.parse_args(arguments[1:])
+    logging.basicConfig(level=logging.INFO)
+    raise SystemExit(_run(args.env, args.phase, args.shard, args.n_shards, args.procs, args.max_hours))
+
+
+if __name__ == "__main__" and not _timing_cli(sys.argv[1:]) and not _run_cli(sys.argv[1:]):
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", required=True, choices=_ENVS)
     parser.add_argument("--shard", required=True, type=int)
