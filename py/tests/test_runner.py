@@ -11,6 +11,7 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 from brier_sim import runner
+from PIL import Image
 
 ENV = "gym_pusht/PushT-v0"
 POLICY = "lerobot/diffusion_pusht"
@@ -123,8 +124,129 @@ def test_runner_persists_raw_telemetry_and_typed_schema(rollout: _Rollout) -> No
         assert trajectory["goal_distance_final"] >= trajectory["goal_distance_min"]
         for key, value in episode[-1][4].items():
             np.testing.assert_equal(terminal[key], value)
-        assert row["keyframes_uri"] is None
+        files = list((directory / row["keyframes_uri"]).glob("*.png"))
+        assert len(files) == 1 and files[0].name == "frame-0002.png"
+        with Image.open(files[0]) as image:
+            np.testing.assert_equal(np.asarray(image), episode[-1][0]["pixels"])
         assert row["wall_seconds"] >= 0
+
+
+def test_runner_preserves_pinned_revision_in_loader_and_raw_provenance(
+    rollout: _Rollout, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, environment, policy = rollout
+    pinned = "a" * 40
+    received = []
+
+    def load(env: str, checkpoint: str, tier: str, *, revision: str):
+        received.append((env, checkpoint, tier, revision))
+        return environment, policy
+
+    monkeypatch.setattr(runner, "_load", load)
+    rows = pq.read_table(runner.run_episodes(*ARGS, revision=pinned)).to_pylist()
+    assert received == [(ENV, POLICY, "cheap", pinned)]
+    assert all(row["policy"] == POLICY for row in rows)
+    assert all(json.loads(row["terminal_state"])["checkpoint_revision"] == pinned for row in rows)
+
+
+@pytest.mark.parametrize("revision", ["main", "a" * 39, "z" * 40, True, 1])
+def test_runner_rejects_unpinned_revisions_before_model_loading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, revision,
+) -> None:
+    monkeypatch.setenv("BRIER_DATA", str(tmp_path))
+    load = runner._load
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid policy revisions must fail before loading")
+
+    monkeypatch.setattr(runner, "_load", unexpected)
+    with pytest.raises(ValueError, match="immutable 40-hex"):
+        runner.run_episodes(*ARGS, revision=revision)
+    with pytest.raises(ValueError, match="immutable 40-hex"):
+        load(ENV, POLICY, "cheap", revision=revision)
+
+
+@pytest.mark.parametrize("aloha", [False, True])
+@pytest.mark.parametrize("tier,success,writer_failure", [("expensive", False, False), ("expensive", True, False),
+                                                       ("cheap", False, False), ("baseline", False, False),
+                                                       ("expensive", False, True)])
+def test_runner_records_failure_frames_and_cheap_final_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, aloha: bool, tier: str, success: bool, writer_failure: bool,
+) -> None:
+    clock = [0.0]
+
+    class FrameEnv:
+        def __init__(self) -> None:
+            self.index, self.closed = 0, False
+            self.pixels = np.zeros((4, 5, 3), dtype=np.uint8)
+            self.unwrapped = SimpleNamespace(_env=SimpleNamespace(physics=SimpleNamespace(
+                data=SimpleNamespace(qpos=np.zeros(3), qvel=np.zeros(3)))))
+
+        def observation(self) -> dict[str, Any]:
+            self.pixels.fill(self.index)
+            return {"pixels": {"top": self.pixels} if aloha else self.pixels,
+                    "agent_pos": np.zeros(2)}
+
+        def reset(self, **kwargs: Any):
+            return self.observation(), {}
+
+        def step(self, action: np.ndarray):
+            self.index += 1
+            clock[0] += 1
+            return self.observation(), 0.0, False, self.index == 8, {"is_success": success}
+
+        def close(self) -> None:
+            self.closed = True
+
+    environment = FrameEnv()
+    monkeypatch.setenv("BRIER_DATA", str(tmp_path))
+    monkeypatch.setattr(runner, "_load", lambda *_: (environment, _Policy()))
+    monkeypatch.setattr(runner, "snapshot", lambda _: {})
+    monkeypatch.setattr(runner, "summarize", lambda *_: {})
+    monkeypatch.setattr(runner.time, "perf_counter", lambda: clock[0])
+    save = runner.save_keyframes
+
+    def timed_save(*args, **kwargs):
+        directory = save(*args, **kwargs)
+        clock[0] += 3
+        return directory
+
+    monkeypatch.setattr(runner, "save_keyframes", timed_save)
+    args = ("gym_aloha/AlohaTransferCube-v0", "lerobot/act_aloha_sim_transfer_cube_human",
+            1, 17, "c081", "aloha_transfer_cube-s01", tier) if aloha else (
+                ENV, POLICY, 1, 17, "c001", "pusht-s01", tier)
+    if writer_failure:
+        def fail(*args, **kwargs):
+            raise OSError("Parquet write failed")
+
+        monkeypatch.setattr(runner.pq, "write_table", fail)
+        with pytest.raises(OSError, match="Parquet write failed"):
+            runner.run_episodes(*args)
+        assert environment.closed and not list(tmp_path.rglob("*.png"))
+        assert not list(tmp_path.rglob("*.parquet"))
+        return
+    row = pq.read_table(runner.run_episodes(*args)).to_pylist()[0]
+    assert environment.closed and row["success"] is success
+    if tier == "expensive" and not success:
+        assert row["keyframes_uri"].startswith("public/keyframes/")
+        directory = tmp_path / row["keyframes_uri"]
+        files = sorted(directory.glob("*.png"))
+        assert len(files) == 8
+        assert [int(path.stem.split("-")[1]) for path in files] == [0, 1, 2, 3, 4, 5, 6, 8]
+        for path in files:
+            with Image.open(path) as image:
+                assert np.all(np.asarray(image) == int(path.stem.split("-")[1]))
+        assert row["wall_seconds"] == 11.0
+    elif tier == "cheap":
+        files = list((tmp_path / row["keyframes_uri"]).glob("*.png"))
+        assert len(files) == 1 and files[0].name == "frame-0008.png"
+        with Image.open(files[0]) as image:
+            assert np.all(np.asarray(image) == 8)
+        assert row["wall_seconds"] == 8.0
+    else:
+        assert row["keyframes_uri"] is None
+        assert not list(tmp_path.rglob("*.png"))
+        assert row["wall_seconds"] == 8.0
 
 
 def test_runner_repeats_environment_and_torch_seeds(
@@ -141,9 +263,14 @@ def test_runner_repeats_environment_and_torch_seeds(
     monkeypatch.setattr(runner, "_load", load)
     first = pq.read_table(runner.run_episodes(*ARGS)).to_pylist()
     second = pq.read_table(runner.run_episodes(*ARGS)).to_pylist()
+    for left, right in zip(first, second, strict=True):
+        left_frame = next((tmp_path / left["keyframes_uri"]).glob("*.png"))
+        right_frame = next((tmp_path / right["keyframes_uri"]).glob("*.png"))
+        assert left_frame.read_bytes() == right_frame.read_bytes()
     for rows in (first, second):
         for row in rows:
             row.pop("wall_seconds")
+            row.pop("keyframes_uri")
     assert first == second
     assert len(environments) == 2 and all(env.closed for env in environments)
 
@@ -346,6 +473,7 @@ def test_runner_preserves_existing_parquet_on_output_collision(
     ],
 )
 @pytest.mark.parametrize("tier", ["cheap", "expensive", "baseline"])
+@pytest.mark.parametrize("revision", [None, "a" * 40])
 def test_loader_uses_strict_checkpoint_and_tier_horizon(
     monkeypatch: pytest.MonkeyPatch,
     environment_id: str,
@@ -353,6 +481,7 @@ def test_loader_uses_strict_checkpoint_and_tier_horizon(
     policy_name: str,
     horizon: int,
     tier: str,
+    revision: str | None,
 ) -> None:
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.policies.act.modeling_act import ACTPolicy
@@ -361,6 +490,8 @@ def test_loader_uses_strict_checkpoint_and_tier_horizon(
     environment, policy = _RecordedEnv(), _Policy()
     config = SimpleNamespace(pretrained_backbone_weights="IMAGENET1K_V1")
     loaded: list[str] = []
+    phases = []
+    expected_revision = revision
 
     def make(identifier: str, **kwargs: Any) -> _RecordedEnv:
         assert identifier == environment_id
@@ -372,7 +503,8 @@ def test_loader_uses_strict_checkpoint_and_tier_horizon(
 
     def load_config(identifier: str, **kwargs: Any) -> SimpleNamespace:
         assert identifier == checkpoint
-        assert kwargs == {"cli_overrides": ["--device=cpu"]}
+        assert kwargs == {"cli_overrides": ["--device=cpu"], **({"revision": revision} if revision else {})}
+        phases.append("config")
         return config
 
     monkeypatch.setattr(runner.gym, "make", make)
@@ -384,17 +516,22 @@ def test_loader_uses_strict_checkpoint_and_tier_horizon(
             *,
             config: SimpleNamespace,
             strict: bool,
+            revision: str | None = None,
             name: str = model.__name__,
         ) -> _Policy:
             assert identifier == checkpoint and strict is True
             assert config.pretrained_backbone_weights is None
+            assert phases == ["config"]
+            assert revision == expected_revision
+            phases.append("policy")
             loaded.append(name)
             return policy
 
         monkeypatch.setattr(model, "from_pretrained", load_policy)
     try:
-        assert runner._load(environment_id, checkpoint, tier) == (environment, policy)
+        assert runner._load(environment_id, checkpoint, tier, revision=revision) == (environment, policy)
         assert loaded == [policy_name]
+        assert phases == ["config", "policy"]
         assert policy.training is False
     finally:
         environment.close()
