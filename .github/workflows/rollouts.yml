@@ -82,7 +82,7 @@ jobs:
       - name: Run assigned work
         run: |
           if [ '${{ inputs.phase }}' = timing ]; then
-            python -m brier_sim.farm timing --env '${{ inputs.env }}'
+            python -u -c 'import faulthandler, runpy; faulthandler.dump_traceback_later(180, repeat=True); runpy.run_module("brier_sim.farm", run_name="__main__")' timing --env '${{ inputs.env }}'
           else
             status=0
             python -m brier_sim.farm run --env '${{ inputs.env }}' --phase '${{ inputs.phase }}' --shard '${{ matrix.shard }}' --n-shards '${{ inputs.n_shards }}' --procs 4 --max-hours 5.5 || status=$?
