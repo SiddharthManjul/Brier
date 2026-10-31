@@ -297,12 +297,15 @@ def _guide_logits(model: nn.ModuleDict, vectors: torch.Tensor, rows: list[dict])
 
 
 def _guide_fit(inputs: dict) -> tuple[nn.ModuleDict, dict]:
+    from brier_ml.glimmer_data import calibration_partition
     from brier_ml.losses import proper_loss
 
     train, calibration = inputs["train"], inputs["calibration"]
     if {row["question"] for row in train[0]} != set(_VALUES):
         raise ValueError("train embeddings must contain all three questions")
-    regressed = [i for i, row in enumerate(calibration[0]) if row["question"] == "regressed"]
+    fit_ids, risk_ids = calibration_partition(row["change_id"] for row in calibration[0])
+    regressed = [i for i, row in enumerate(calibration[0])
+                 if row["question"] == "regressed" and row["change_id"] in fit_ids]
     if not regressed:
         raise ValueError("calibration requires regressed examples for early stopping")
     mean, std = train[1].mean(0), train[1].std(0, unbiased=False).clamp_min(1e-6)
@@ -336,7 +339,8 @@ def _guide_fit(inputs: dict) -> tuple[nn.ModuleDict, dict]:
                 break
         model.load_state_dict(state)
     return model, {"mean": mean, "std": std, "history": history, "best_epoch": best_epoch,
-                   "calibration_regressed_nll": best, "seed": 2026}
+                   "calibration_regressed_nll": best, "seed": 2026,
+                   "calibration_partition": {"fit_change_ids": fit_ids, "risk_change_ids": risk_ids}}
 
 
 def _guide_main() -> None:
