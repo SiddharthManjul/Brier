@@ -4,7 +4,7 @@
     "pusht": {
       "repo_id": "lerobot/diffusion_pusht",
       "revision": "84a7c23178445c6bbf7e1a884ff497017910f653",
-      "num_inference_steps": 10
+      "num_inference_steps": 2
     },
     "aloha": {
       "repo_id": "lerobot/act_aloha_sim_transfer_cube_human",
