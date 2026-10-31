@@ -320,8 +320,10 @@ def _training_config(identifier: str, revision: str, compiled: Path, model: Any,
                          "projections": _PROJECTIONS, "quantization": "nf4", "compute": "bf16"}}
 
 
-def train(compiled: Path, smoke: bool = False) -> dict[str, Any]:
+def train(compiled: Path | dict[str, Any], smoke: bool = False) -> dict[str, Any]:
     """Train or resume a text-decoder QLoRA adapter using verbatim compiled prompts."""
+    if isinstance(compiled, dict):
+        return _guide_train(compiled)
     identifier, revision = _required("MODAL_MODEL_ID"), _required("MODAL_MODEL_REVISION")
     directory, volume_name = _training_paths(compiled, smoke, revision)
     rows = load_training_data(compiled)
@@ -331,6 +333,253 @@ def train(compiled: Path, smoke: bool = False) -> dict[str, Any]:
     config = _training_config(identifier, revision, compiled, model, smoke)
     volume = modal.Volume.from_name(volume_name)
     return _fit(model, encoded, directory, config, smoke, volume.commit)
+
+
+def _guide_train(cfg: dict[str, Any]) -> dict[str, Any]:
+    started = time.perf_counter()
+    import importlib.metadata
+    import logging
+    import shutil
+
+    from peft import get_peft_model_state_dict, set_peft_model_state_dict
+    from peft.utils.save_and_load import load_peft_weights
+
+    from brier_ml import glimmer_data as gd
+    from brier_ml import glimmer_model as gm
+    from brier_ml.losses import option_probs, proper_loss
+    from brier_ml.modal_train import BASE_DIR, BASE_REPO, MODELS
+
+    logger = logging.getLogger(__name__)
+    defaults = {"effective_batch": 32, "lr": 1e-4, "warmup_frac": 0.03, "epochs": 1,
+                    "max_steps": None, "ckpt_every": 50, "eval_every": 50, "seed": 2026, "init_adapter": None}
+    if set(cfg) - (set(defaults) | {"run_id", "quant", "micro_batch", "max_usd", "usd_per_sec"}):
+        raise ValueError("unknown training configuration fields")
+    cfg = defaults | cfg
+    required = {"run_id", "quant", "micro_batch", "max_usd", "usd_per_sec"}
+    if not required <= cfg.keys() or not isinstance(cfg["run_id"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", cfg["run_id"]):
+        raise ValueError("training requires run_id, quant, micro_batch, max_usd and usd_per_sec")
+    if (cfg["quant"] not in {"bf16", "nf4"}
+            or any(type(cfg[k]) is not int or cfg[k] < 1 for k in
+                   ("micro_batch", "effective_batch", "epochs", "ckpt_every", "eval_every"))
+            or cfg["effective_batch"] % cfg["micro_batch"] or type(cfg["seed"]) is not int or cfg["seed"] < 0
+            or (cfg["max_steps"] is not None and (type(cfg["max_steps"]) is not int or cfg["max_steps"] < 1))
+            or any(type(cfg[k]) not in (int, float) or not math.isfinite(cfg[k]) or cfg[k] <= 0
+                   for k in ("lr", "max_usd", "usd_per_sec"))
+            or not 0 <= cfg["warmup_frac"] <= 1
+            or (cfg["init_adapter"] is not None and not isinstance(cfg["init_adapter"], str))):
+        raise ValueError("invalid finite training configuration or accumulation count")
+    random.seed(cfg["seed"])
+    np.random.seed(cfg["seed"])
+    torch.manual_seed(cfg["seed"])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg["seed"])
+    path = Path(_required("BRIER_DATA")) / "compiled.jsonl"
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    revision = (Path(BASE_DIR) / "revision.txt").read_text().strip()
+    model, tokenizer, info = gm.load_base(BASE_DIR, revision, cfg["quant"])
+    model = gm.add_lora(model)
+    rows = gd.load_examples(path, ["train", "calibration"])
+    train_rows = gd.tokenize([r for r in rows if r["split"] == "train"], tokenizer)
+    evaluation = sorted((r for r in rows if r["split"] == "calibration"
+                         and r["question"] == "regressed" and r["variant"] == "ev"), key=lambda r: r["id"])[:256]
+    eval_rows = gd.tokenize(evaluation, tokenizer)
+    letters, pad = gd.letter_token_ids(tokenizer), train_rows[0]["pad_id"]
+    device = next(model.parameters()).device
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=cfg["lr"], betas=(0.9, 0.999),
+                                 weight_decay=0.0, fused=device.type == "cuda")
+    per_epoch = math.ceil(len(train_rows) / cfg["effective_batch"])
+    total = cfg["max_steps"] or per_epoch * cfg["epochs"]
+    warmup = math.ceil(cfg["warmup_frac"] * total)
+
+    def factor(s: int) -> float:
+        return (s + 1) / warmup if s < warmup else (
+            0.5 * (1 + math.cos(math.pi * min(1, (s - warmup + 1) / max(1, total - warmup)))))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
+    run = Path(BASE_DIR).parent.parent / "runs" / cfg["run_id"]
+    run.mkdir(parents=True, exist_ok=True)
+    log = run / "train_log.jsonl"
+    step = epoch = cursor = tokens = examples = 0
+    prior = 0.0
+    best, best_step, last_eval = None, None, None
+    def restore_adapter(location: str) -> None:
+        weights = load_peft_weights(location, device="cpu")
+        expected = get_peft_model_state_dict(model)
+        if weights.keys() != expected.keys() or any(weights[k].shape != expected[k].shape for k in expected):
+            raise ValueError("checkpoint adapter parameter names or shapes differ")
+        set_peft_model_state_dict(model, weights)
+
+    checkpoints = sorted(p for p in run.glob("ckpt-*") if re.fullmatch(r"ckpt-\d{6}", p.name))
+    if checkpoints:
+        checkpoint = checkpoints[-1]
+        state = json.loads((checkpoint / "state.json").read_text())
+        if state["config"] != cfg or state["data_hash"] != digest or state["revision"] != revision:
+            raise ValueError("checkpoint configuration, dataset hash or base revision differs")
+        step, epoch, cursor = (state[k] for k in ("step", "epoch", "cursor"))
+        accum = cfg["effective_batch"] // cfg["micro_batch"]
+        if (any(type(n) is not int or n < 0 for n in (step, epoch, cursor)) or step > total
+                or not 0 <= step - epoch * per_epoch <= per_epoch
+                or cursor != min((step - epoch * per_epoch) * accum, math.ceil(len(train_rows) / cfg["micro_batch"]))):
+            raise ValueError("checkpoint step, epoch or micro-batch cursor is inconsistent")
+        restore_adapter(str(checkpoint))
+        optimizer.load_state_dict(torch.load(checkpoint / "optimizer.pt", map_location=device, weights_only=True))
+        scheduler.load_state_dict(torch.load(checkpoint / "scheduler.pt", weights_only=True))
+        rng = state["rng"]
+        random.setstate((rng["python"][0], tuple(rng["python"][1]), rng["python"][2]))
+        ns = rng["numpy"]
+        np.random.set_state((ns[0], np.array(ns[1], dtype="uint32"), *ns[2:]))
+        torch.set_rng_state(torch.tensor(rng["torch"], dtype=torch.uint8))
+        if rng["cuda"]:
+            torch.cuda.set_rng_state_all([torch.tensor(s, dtype=torch.uint8) for s in rng["cuda"]])
+        prior, tokens, examples = (state[k] for k in ("seconds", "tokens", "examples"))
+        best, best_step, last_eval = (state[k] for k in ("best_eval_nll", "best_step", "eval"))
+        if log.exists():
+            lines = log.read_text().splitlines(keepends=True)
+            retained = []
+            for i, line in enumerate(lines):
+                try:
+                    if json.loads(line)["step"] <= step:
+                        retained.append(line.rstrip("\n") + "\n")
+                except json.JSONDecodeError:
+                    if i != len(lines) - 1 or line.endswith("\n"):
+                        raise
+            log.write_text("".join(retained))
+    elif cfg["init_adapter"]:
+        restore_adapter(cfg["init_adapter"])
+    model.train()
+
+    def seconds() -> float:
+        return prior + time.perf_counter() - started
+
+    def batch(selected: list[dict]) -> dict:
+        return {k: v.to(device) for k, v in gd.collate(selected, pad).items()}
+
+    def logits(b: dict) -> Any:
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            return gm.option_logits(gm.last_logits(model, b), letters)
+
+    def evaluate() -> dict:
+        model.eval()
+        nll = brier = 0.0
+        with torch.no_grad():
+            for start in range(0, len(eval_rows), cfg["micro_batch"]):
+                b = batch(eval_rows[start:start + cfg["micro_batch"]])
+                p = option_probs(logits(b), b["valid"])
+                truth = F.one_hot(b["label_idx"], 6)
+                nll += (-p.gather(1, b["label_idx"][:, None]).clamp_min(1e-12).log()).sum().item()
+                brier += ((p - truth) ** 2).sum().item()
+        model.train()
+        result = {"nll": nll / len(eval_rows), "brier": brier / len(eval_rows)}
+        if not all(math.isfinite(value) for value in result.values()):
+            raise FloatingPointError(f"nonfinite evaluation at step {step}")
+        return result
+
+    def save() -> None:
+        dest = run / f"ckpt-{step:06d}"
+        temporary = run / f".ckpt-{step:06d}.tmp"
+        shutil.rmtree(temporary, ignore_errors=True)
+        model.save_pretrained(temporary)
+        torch.save(optimizer.state_dict(), temporary / "optimizer.pt")
+        torch.save(scheduler.state_dict(), temporary / "scheduler.pt")
+        ns = np.random.get_state()
+        rng = {"python": random.getstate(), "numpy": [ns[0], ns[1].tolist(), *ns[2:]],
+               "torch": torch.get_rng_state().tolist(),
+               "cuda": [s.tolist() for s in torch.cuda.get_rng_state_all()] if device.type == "cuda" else []}
+        state = {"step": step, "epoch": epoch, "cursor": cursor, "rng": rng, "config": cfg, "data_hash": digest,
+                     "revision": revision, "seconds": seconds(), "tokens": tokens, "examples": examples,
+                     "best_eval_nll": best, "best_step": best_step, "eval": last_eval}
+        (temporary / "state.json").write_text(json.dumps(state, allow_nan=False) + "\n")
+        if dest.exists():
+            shutil.rmtree(dest)
+        temporary.rename(dest)
+        existing = sorted(p for p in run.glob("ckpt-*") if re.fullmatch(r"ckpt-\d{6}", p.name))
+        keep = set(existing[-2:]) | {run / f"ckpt-{best_step:06d}" if best_step is not None else dest}
+        for old in set(existing) - keep:
+            shutil.rmtree(old)
+        MODELS.commit()
+
+    accum = cfg["effective_batch"] // cfg["micro_batch"]
+    lengths = [len(r["input_ids"]) for r in train_rows]
+    while step < total:
+        if seconds() * cfg["usd_per_sec"] >= cfg["max_usd"]:
+            save()
+            logger.warning("Budget stop at step %d: elapsed %.2fs, spend $%.4f", step, seconds(), seconds() * cfg["usd_per_sec"])
+            return {"status": "budget_stop", "step": step, "seconds": seconds(), "spend": seconds() * cfg["usd_per_sec"]}
+        order = gd.length_grouped_order(lengths, cfg["micro_batch"], cfg["seed"] + epoch)
+        batches = [order[i:i + cfg["micro_batch"]] for i in range(0, len(order), cfg["micro_batch"])]
+        if cursor == len(batches):
+            epoch, cursor = epoch + 1, 0
+            continue
+        selected = batches[cursor:cursor + accum]
+        optimizer.zero_grad(set_to_none=True)
+        loss_sum = ce_sum = extra_sum = 0.0
+        tick, used_tokens, used_examples = time.perf_counter(), 0, 0
+        for indices in selected:
+            source = [train_rows[i] for i in indices]
+            b = batch(source)
+            scores = logits(b)
+            if not torch.isfinite(scores).all():
+                raise FloatingPointError(f"nonfinite logits at step {step + 1}: {[r['id'] for r in source]}")
+            loss, parts = proper_loss(scores, b["valid"], b["label_idx"], b["k"].eq(5), b["ordinal_map"])
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"nonfinite loss at step {step + 1}: {[r['id'] for r in source]}")
+            (loss / len(selected)).backward()
+            loss_sum += loss.item() / len(selected)
+            ce_sum += parts["ce"].item() / len(selected)
+            extra_sum += parts["extra"].item() / len(selected)
+            used_tokens += int(b["attention_mask"].sum())
+            used_examples += len(source)
+        norm = torch.nn.utils.clip_grad_norm_(params, 1.0)
+        if not torch.isfinite(norm):
+            raise FloatingPointError(f"nonfinite gradient at step {step + 1}: {[train_rows[i]['id'] for ids in selected for i in ids]}")
+        optimizer.step()
+        scheduler.step()
+        step, cursor = step + 1, cursor + len(selected)
+        tokens, examples = tokens + used_tokens, examples + used_examples
+        duration = time.perf_counter() - tick
+        record = {"step": step, "loss": loss_sum, "ce": ce_sum, "extra": extra_sum, "lr": optimizer.param_groups[0]["lr"],
+                      "grad_norm": float(norm), "examples_per_second": used_examples / duration,
+                      "tokens_per_second": used_tokens / duration, "step_seconds": duration,
+                      "peak_memory": torch.cuda.max_memory_reserved() if device.type == "cuda" else 0,
+                      "elapsed_seconds": seconds(), "spend": seconds() * cfg["usd_per_sec"]}
+        if step % cfg["eval_every"] == 0 or step == total:
+            last_eval = evaluate()
+            record["eval"] = last_eval
+            if best is None or last_eval["nll"] < best:
+                best, best_step = last_eval["nll"], step
+        with log.open("a") as stream:
+            stream.write(json.dumps(record, allow_nan=False) + "\n")
+        logger.info("Training %s", record)
+        if step % cfg["ckpt_every"] == 0 or step == total or best_step == step:
+            save()
+    model.save_pretrained(run / "adapter")
+    manifest = run / "adapter" / "brier-model.json"
+    manifest_temp = manifest.with_suffix(".json.tmp")
+    manifest_temp.write_text(json.dumps({"config": {"model_id": BASE_REPO, "revision": revision,
+                             "dataset_digest": digest, "recipe": cfg}, "step": step}, allow_nan=False) + "\n")
+    manifest_temp.replace(manifest)
+    meta = dict(info, base_repo=BASE_REPO, revision=revision, config=cfg, steps=step, epochs=epoch + 1,
+                data_sha256=digest, letter_token_ids=letters, pad_id=pad, pad_source=train_rows[0]["pad_source"],
+                lora_config={k: v.to_dict() for k, v in model.peft_config.items()},
+                target_names=sorted(n for n, module in model.named_modules() if hasattr(module, "lora_A")), final_eval_nll=last_eval["nll"],
+                tokens_per_second=tokens / seconds(), gpu_type=torch.cuda.get_device_name() if device.type == "cuda" else "cpu",
+                seconds=seconds(), spend=seconds() * cfg["usd_per_sec"],
+                versions={name: importlib.metadata.version(name) for name in
+                          ("torch", "transformers", "peft", "accelerate", "safetensors", "huggingface_hub", "numpy", "modal")})
+    (run / "run_meta.json").write_text(json.dumps(meta, default=lambda v: sorted(v) if isinstance(v, set) else str(v), allow_nan=False) + "\n")
+    if cfg["max_steps"] is not None:
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        measured = records[5:]
+        median = float(np.median([r["step_seconds"] for r in measured])) if measured else None
+        report = {"median_seconds_per_step": median, "tokens_per_second": meta["tokens_per_second"],
+                      "peak_memory": max(r["peak_memory"] for r in records),
+                      "first_10_mean_loss": float(np.mean([r["loss"] for r in records[:10]])),
+                      "last_10_mean_loss": float(np.mean([r["loss"] for r in records[-10:]])),
+                      "projected_epoch_cost": None if median is None else per_epoch * median * cfg["usd_per_sec"]}
+        (run / "smoke_report.json").write_text(json.dumps(report, allow_nan=False) + "\n")
+    MODELS.commit()
+    return meta
 
 
 app = modal.App("brier-finetune")
