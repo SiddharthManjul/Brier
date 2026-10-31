@@ -133,15 +133,41 @@ fn fixture(successes: usize, telemetry: bool, expensive_count: usize) -> Fixture
 }
 
 fn command(f: &Fixture) -> std::process::Output {
+    command_at(f, &f.directory.join("episodes"))
+}
+
+fn command_at(f: &Fixture, episodes: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_brier"))
         .arg("label")
         .arg("--ledger")
         .arg(&f.ledger)
         .arg("--episodes")
-        .arg(f.directory.join("episodes"))
+        .arg(episodes)
         .arg("--catalog")
         .arg(f.directory.join("catalog.json"))
         .output()
+        .unwrap()
+}
+
+fn stage(f: &Fixture, name: &str, tier: &str) -> PathBuf {
+    let path = f.directory.join(name);
+    fs::create_dir(&path).unwrap();
+    fs::copy(
+        f.directory.join("episodes").join(format!("{tier}.parquet")),
+        path.join(format!("{tier}.parquet")),
+    )
+    .unwrap();
+    path
+}
+
+fn counts(f: &Fixture) -> (i64, i64) {
+    Connection::open(&f.ledger)
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM runs),(SELECT count(*) FROM labels)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
         .unwrap()
 }
 
@@ -230,4 +256,99 @@ fn label_rejects_partial_and_duplicate_groups_atomically() {
             .unwrap(),
         1
     );
+}
+
+#[test]
+fn staged_baseline_cheap_and_expensive_imports_create_one_authoritative_label() {
+    let f = fixture(12, true, 20);
+    let baseline = stage(&f, "baseline-stage", "baseline");
+    let cheap = stage(&f, "cheap-stage", "cheap");
+    let expensive = stage(&f, "expensive-stage", "expensive");
+    let first = command_at(&f, &baseline);
+    assert!(first.status.success(), "{:?}", first);
+    assert_eq!(counts(&f), (1, 0));
+    let repeated = command_at(&f, &baseline);
+    assert!(!repeated.status.success());
+    assert!(String::from_utf8_lossy(&repeated.stderr).contains("already imported"));
+    fs::write(
+        f.directory.join("episodes/expensive.parquet"),
+        b"unavailable ground truth",
+    )
+    .unwrap();
+    let stage_a = command_at(&f, &cheap);
+    assert!(stage_a.status.success(), "{:?}", stage_a);
+    assert_eq!(counts(&f), (2, 0));
+    assert!(!command_at(&f, &cheap).status.success());
+    assert_eq!(counts(&f), (2, 0));
+    let stage_b = command_at(&f, &expensive);
+    assert!(stage_b.status.success(), "{:?}", stage_b);
+    assert_eq!(counts(&f), (3, 1));
+    let connection = Connection::open(&f.ledger).unwrap();
+    let label: (String, i64, String, i64) = connection
+        .query_row(
+            "SELECT change_id,regressed,failure_mode,success_bucket FROM labels",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(label, ("c002".into(), 1, "stall/timeout".into(), 3));
+    assert!(!command_at(&f, &expensive).status.success());
+    assert_eq!(counts(&f), (3, 1));
+}
+
+#[test]
+fn partial_stages_and_expensive_before_cheap_leave_prior_state_unchanged() {
+    let f = fixture(12, true, 20);
+    let baseline = stage(&f, "baseline-stage", "baseline");
+    let cheap = stage(&f, "cheap-stage", "cheap");
+    let expensive = stage(&f, "expensive-stage", "expensive");
+    let missing_baseline = command_at(&f, &cheap);
+    assert!(!missing_baseline.status.success());
+    assert!(String::from_utf8_lossy(&missing_baseline.stderr).contains("50-episode baseline"));
+    assert_eq!(counts(&f), (0, 0));
+    assert!(command_at(&f, &baseline).status.success());
+    let missing_cheap = command_at(&f, &expensive);
+    assert!(!missing_cheap.status.success());
+    assert!(String::from_utf8_lossy(&missing_cheap.stderr).contains("three-episode cheap run"));
+    assert_eq!(counts(&f), (1, 0));
+    write_episodes(&cheap.join("cheap.parquet"), "cheap", 2, 1, false);
+    assert!(!command_at(&f, &cheap).status.success());
+    assert_eq!(counts(&f), (1, 0));
+    write_episodes(&cheap.join("cheap.parquet"), "cheap", 3, 2, false);
+    assert!(command_at(&f, &cheap).status.success());
+    assert_eq!(counts(&f), (2, 0));
+    write_episodes(
+        &expensive.join("expensive.parquet"),
+        "expensive",
+        19,
+        12,
+        true,
+    );
+    assert!(!command_at(&f, &expensive).status.success());
+    assert_eq!(counts(&f), (2, 0));
+    write_episodes(
+        &expensive.join("expensive.parquet"),
+        "expensive",
+        20,
+        12,
+        true,
+    );
+    assert!(command_at(&f, &expensive).status.success());
+    assert_eq!(counts(&f), (3, 1));
+}
+
+#[test]
+fn staged_import_rejects_catalog_drift_against_stored_baseline_scenario() {
+    let f = fixture(12, true, 20);
+    let baseline = stage(&f, "baseline-stage", "baseline");
+    let cheap = stage(&f, "cheap-stage", "cheap");
+    assert!(command_at(&f, &baseline).status.success());
+    let path = f.directory.join("catalog.json");
+    let mut catalog: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    catalog["scenarios"][0]["params"]["lighting"] = json!("low");
+    fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+    let result = command_at(&f, &cheap);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("catalog changes existing scenario"));
+    assert_eq!(counts(&f), (1, 0));
 }
