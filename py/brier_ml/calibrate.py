@@ -104,7 +104,7 @@ def fit_temperatures(records: list[dict[str, Any]] | Path | str) -> dict[str, An
     Returned metrics describe calibration rows only; multiclass Brier sums options.
     """
     if isinstance(records, (str, Path)):
-        return _fit_scores(_score_rows(records))
+        return _fit_scores(_score_rows(records), Path(records).parent.parent)
     if not isinstance(records, list) or not records:
         raise ValueError("records must be a nonempty list of scored compiled rows")
     required = {"id", "split", "question", "options", "label", "probabilities"}
@@ -229,7 +229,21 @@ def _score_rows(path: Path | str) -> list[dict]:
     return rows
 
 
-def _fit_scores(rows: list[dict]) -> dict[str, float]:
+def _partition(rows: list[dict], model_dir: Path) -> dict:
+    from brier_ml.glimmer_data import calibration_partition
+
+    fit, risk = calibration_partition([row["pair_id"].split(":")[0] for row in rows])
+    partition = {"fit_change_ids": fit, "risk_change_ids": risk}
+    for name in ("meta.json", "run_meta.json"):
+        path = model_dir / name
+        if path.exists():
+            meta = json.loads(path.read_text(encoding="utf-8"))
+            if "calibration_partition" in meta and meta["calibration_partition"] != partition:
+                raise ValueError(f"{name} calibration_partition disagrees with scoring calibration changes")
+    return partition
+
+
+def _fit_scores(rows: list[dict], model_dir: Path) -> dict[str, float]:
     from scipy.optimize import minimize_scalar
     from scipy.special import logsumexp
 
@@ -237,6 +251,8 @@ def _fit_scores(rows: list[dict]) -> dict[str, float]:
 
     if any(row["split"] != "calibration" or "temperature" in row for row in rows):
         raise ValueError("temperature fitting requires only unscaled calibration scores")
+    partition = _partition(rows, model_dir)
+    rows = [row for row in rows if row["pair_id"].split(":")[0] in partition["fit_change_ids"]]
     result = {}
     for question, options in _OPTIONS.items():
         selected = [row for row in rows if row["question"] == question]
@@ -329,6 +345,7 @@ def _main() -> None:
         raise ValueError("all scoring splits must share provenance and have disjoint changes")
     temps = fit_temperatures(paths["calibration"])
     report = {"model": source["model"], "revision": source["revision"], "temperatures": temps, "splits": {}}
+    report["calibration_partition"] = _partition(datasets["calibration"], args.model_dir)
     for split, path in paths.items():
         scaled = apply(path, temps)
         if split != "calibration":
