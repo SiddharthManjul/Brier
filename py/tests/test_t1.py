@@ -101,6 +101,10 @@ def test_export_predictions_match_lightgbm_isotonic_and_json_roundtrip(dataset_f
     assert np.allclose(predict_t1(artifact, dataset["features"]), expected, atol=1e-12)
     assert artifact == json.loads(output.read_text())
     assert artifact["feature_names"] == FEATURE_NAMES
+    assert artifact["training_change_ids"] == [f"c{i:03}" for i in range(8)]
+    assert artifact["calibration_change_ids"] == [f"c{i:03}" for i in range(8, 12)]
+    assert artifact["model_version"].startswith("t1@")
+    assert len(artifact["model_version"]) == 67
 
 
 def test_heldout_labels_cannot_change_features_or_fitted_artifact(dataset_files: tuple[Path, Path], tmp_path: Path) -> None:
