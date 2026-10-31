@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 from brier_ml import finetune, modal_train
+from brier_ml import glimmer_data as gd
 from brier_ml import glimmer_model as gm
 from tokenizers import Tokenizer
 from transformers import LlamaConfig, LlamaForCausalLM
@@ -38,13 +39,14 @@ class _Tokenizer:
 
 
 def _example(i, split):
-    change = next(f"c{n:03}" for n in range(1, 1000) if
-                  (int.from_bytes(hashlib.sha256(f"c{n:03}".encode()).digest()[:4], "big") % 10 < 6)
-                  == (split == "train") and (split == "train" or
-                  int.from_bytes(hashlib.sha256(f"c{n:03}".encode()).digest()[:4], "big") % 10 < 8))
+    changes = [f"c{n:03}" for n in range(1, 1000) if
+               (int.from_bytes(hashlib.sha256(f"c{n:03}".encode()).digest()[:4], "big") % 10 < 6)
+               == (split == "train") and (split == "train" or
+               int.from_bytes(hashlib.sha256(f"c{n:03}".encode()).digest()[:4], "big") % 10 < 8)]
+    change = changes[0 if split == "train" else i // 2]
     scenario, question = f"pusht-s{i // 3 + 1:02}", list(_QUESTIONS)[i % 3] if split == "train" else "regressed"
     if split != "train":
-        scenario = f"pusht-s{i + 1:02}"
+        scenario = f"pusht-s{i % 2 + 1:02}"
     options = _OPTIONS[question].copy()
     if split == "train":
         options.reverse()
@@ -64,7 +66,7 @@ def setup(tmp_path, monkeypatch):
     base.mkdir(parents=True)
     (base / "revision.txt").write_text("1" * 40)
     compiled = tmp_path / "compiled.jsonl"
-    rows = [_example(i, "train") for i in range(22)] + [_example(i, "calibration") for i in range(2)]
+    rows = [_example(i, "train") for i in range(22)] + [_example(i, "calibration") for i in range(40)]
     compiled.write_text("".join(json.dumps(row) + "\n" for row in rows))
     monkeypatch.setenv("BRIER_DATA", str(tmp_path))
     monkeypatch.setattr(modal_train, "BASE_DIR", str(base))
@@ -129,6 +131,9 @@ def test_train_six_steps_real_tiny_lora_resume_matches_uninterrupted(setup, monk
     assert np.isfinite(resumed["final_eval_nll"])
     assert resumed["letter_token_ids"] == [_Tokenizer().encode(" " + c, add_special_tokens=False)[0] for c in "ABCDEF"]
     assert resumed["data_sha256"] == state["data_hash"]
+    fit_ids, risk_ids = gd.calibration_partition(_example(i, "calibration")["change_id"] for i in range(40))
+    assert resumed["calibration_partition"] == state["calibration_partition"] == {
+        "fit_change_ids": fit_ids, "risk_change_ids": risk_ids}
     assert resumed["versions"]["torch"] == torch.__version__.split("+")[0]
     for record in _logs(runs / "resumed"):
         assert {"step", "loss", "ce", "extra", "lr", "grad_norm", "tokens_per_second",
@@ -173,7 +178,7 @@ def test_train_nan_saves_nothing_and_identifies_batch(setup, monkeypatch):
     assert not commits and not list((runs / "full").rglob("*"))
 
 
-@pytest.mark.parametrize("mutation", ["config", "data", "revision", "cursor"])
+@pytest.mark.parametrize("mutation", ["config", "data", "revision", "cursor", "partition", "partition_missing"])
 def test_train_resume_rejects_changed_identity_or_cursor(setup, mutation):
     cfg, runs, _, _, compiled = setup
     finetune.train(cfg)
@@ -185,6 +190,12 @@ def test_train_resume_rejects_changed_identity_or_cursor(setup, mutation):
         compiled.write_text(" " + compiled.read_text())
     elif mutation == "revision":
         state["revision"] = "2" * 40
+        checkpoint.write_text(json.dumps(state))
+    elif mutation.startswith("partition"):
+        if mutation == "partition_missing":
+            del state["calibration_partition"]
+        else:
+            state["calibration_partition"]["fit_change_ids"] = state["calibration_partition"]["risk_change_ids"]
         checkpoint.write_text(json.dumps(state))
     else:
         state["cursor"] += 1
@@ -275,3 +286,49 @@ def test_train_init_adapter_loads_previous_weights_without_optimizer_or_cursor(s
     assert result["steps"] == 1
     assert all(torch.equal(weights[key], value) for key, value in observed[0].items())
     assert _logs(runs / "epoch2")[0]["step"] == 1
+
+
+def test_reserved_risk_labels_cannot_affect_lora_evaluation_or_checkpoint_selection(setup):
+    cfg, runs, _, models, compiled = setup
+    reference = finetune.train(cfg | {"run_id": "reference", "ckpt_every": 1, "eval_every": 1})
+    weights = {name: parameter.detach().clone() for name, parameter in models[-1].named_parameters()
+               if "lora_" in name}
+    partition = reference["calibration_partition"]
+    rows = [json.loads(line) for line in compiled.read_text().splitlines()]
+    train_rows = [row.copy() for row in rows if row["split"] == "train"]
+    changed = 0
+    for row in rows:
+        if row["split"] == "calibration" and row["change_id"] in partition["risk_change_ids"]:
+            changed += row["label"] != "A"
+            row["label"] = "A"
+    assert changed == 19
+    assert [row for row in rows if row["split"] == "train"] == train_rows
+    compiled.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    result = finetune.train(cfg | {"run_id": "perturbed", "ckpt_every": 1, "eval_every": 1})
+    assert result["calibration_partition"] == partition
+    assert reference["data_sha256"] != result["data_sha256"]
+    for name, parameter in models[-1].named_parameters():
+        if name in weights:
+            assert torch.equal(parameter, weights[name])
+    for field in ("loss", "ce", "extra", "eval"):
+        assert [row[field] for row in _logs(runs / "reference")] == [row[field] for row in _logs(runs / "perturbed")]
+    assert reference["final_eval_nll"] == result["final_eval_nll"]
+    for run in ("reference", "perturbed"):
+        state = json.loads((runs / run / "ckpt-000006/state.json").read_text())
+        if run == "reference":
+            best = state["best_step"]
+            checkpoints = sorted(path.name for path in (runs / run).glob("ckpt-*"))
+        else:
+            assert state["best_step"] == best
+            assert sorted(path.name for path in (runs / run).glob("ckpt-*")) == checkpoints
+        assert state["calibration_partition"] == partition
+
+
+def test_training_rejects_insufficient_calibration_changes_before_loading_model(setup):
+    cfg, runs, _, models, compiled = setup
+    rows = [json.loads(line) for line in compiled.read_text().splitlines()]
+    removed = next(row["change_id"] for row in rows if row["split"] == "calibration")
+    compiled.write_text("".join(json.dumps(row) + "\n" for row in rows if row["change_id"] != removed))
+    with pytest.raises(ValueError, match="at least 20 unique"):
+        finetune.train(cfg)
+    assert not models and not runs.exists()
