@@ -1,0 +1,12 @@
+# Set the actual checkpoint revision. This example makes no claim about its outcome.
+env: gym_pusht/PushT-v0
+policy:
+  id: lerobot/diffusion_pusht
+  revision: null
+description: Delay each policy action by two steps
+families:
+  - family: action_latency
+    params:
+      k: 2
+logging:
+  level: info
