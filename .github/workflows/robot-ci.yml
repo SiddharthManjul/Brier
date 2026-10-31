@@ -1,0 +1,311 @@
+name: Robot CI
+
+on:
+  pull_request:
+    paths:
+      - .github/policies/robot.yaml
+      - .github/workflows/robot-ci.yml
+      - crates/brier-core/**
+      - py/brier_sim/**
+      - py/brier_explain/**
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Git commit or ref containing the deployed policy snapshot
+        type: string
+        required: true
+      policy_path:
+        description: Policy snapshot to compare with base_ref
+        type: string
+        default: .github/policies/robot.yaml
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: robot-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  card:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      t0_identical: ${{ steps.card.outputs.t0_identical }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compile and compare policy identities
+        id: card
+        run: |
+          cargo build --release --locked -p brier-core
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+
+          event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+          if os.environ["GITHUB_EVENT_NAME"] == "pull_request":
+              if event["pull_request"]["head"]["repo"]["full_name"] != os.environ["GITHUB_REPOSITORY"]:
+                  raise SystemExit("Robot CI requires a same-repository policy PR")
+              base = event["pull_request"]["base"]["sha"]
+              policy = Path(".github/policies/robot.yaml")
+          else:
+              base = event["inputs"]["base_ref"]
+              policy = Path(event["inputs"]["policy_path"])
+          if policy.is_absolute() or ".." in policy.parts or policy.parts[:2] != (".github", "policies") or policy.suffix != ".yaml":
+              raise SystemExit("policy_path must be a YAML file under .github/policies")
+          base = subprocess.check_output(["git", "rev-parse", f"{base}^{{commit}}"], text=True).strip()
+          head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          change = f"c{1000 + int(head[:15], 16)}"
+          output = Path(os.environ["RUNNER_TEMP"]) / "brier-ci"
+          output.mkdir()
+          shutil.copy2("target/release/brier", output / "brier")
+          with (output / "before.yaml").open("wb") as target:
+              subprocess.run(["git", "show", f"{base}:{policy.as_posix()}"], stdout=target, check=True)
+          shutil.copyfile(policy, output / "after.yaml")
+          with (output / "card.json").open("w") as target:
+              subprocess.run([str(output / "brier"), "card", "--before", str(output / "before.yaml"),
+                              "--after", str(output / "after.yaml"), "--change", change], stdout=target, check=True)
+          card = json.loads((output / "card.json").read_text())
+          changed = subprocess.check_output(["git", "diff", "--name-only", base, head], text=True).splitlines()
+          t0 = card["t0_identical"] and all(path == policy.as_posix() for path in changed)
+          (output / "source-identity.json").write_text(json.dumps({"base": base, "head": head,
+              "changed_paths": changed, "t0_applied": t0}, indent=2) + "\n")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as target:
+              target.write(f"t0_identical={str(t0).lower()}\n")
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as target:
+              if t0:
+                  target.write("## Robot CI: T0 pass\n\nPinned checkpoint and effective no-op parameters are identical. "
+                               "The source diff contains only this policy snapshot. No evaluations were requested. "
+                               "The identity proof is attached as an artifact; no statistical calibration claim is made.\n")
+              else:
+                  target.write("## Robot CI: evaluation required\n\nThe card is validated. "
+                               "Configured baseline, scoring and explanation stages must complete before a verdict.\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: robot-ci-input
+          path: ${{ runner.temp }}/brier-ci
+          if-no-files-found: error
+
+  evaluate:
+    needs: card
+    if: needs.card.outputs.t0_identical != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      BRIER_DATA: ${{ vars.BRIER_DATA }}
+      MODAL_DECIDE_URL: ${{ vars.MODAL_DECIDE_URL }}
+      META_API_KEY: ${{ secrets.META_API_KEY }}
+      BRIER_INGEST_TOKEN: ${{ secrets.BRIER_INGEST_TOKEN }}
+      BRIER_INGEST_URL: ${{ vars.BRIER_INGEST_URL }}
+      MUJOCO_GL: egl
+      PYOPENGL_PLATFORM: egl
+      HF_HUB_DISABLE_XET: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: robot-ci-input
+          path: ${{ runner.temp }}/brier-ci
+      - name: Require rollout configuration and complete CLI interfaces
+        run: |
+          chmod +x "$RUNNER_TEMP/brier-ci/brier"
+          "$RUNNER_TEMP/brier-ci/brier" explain --help
+          python3 - <<'PY'
+          import os
+          from urllib.parse import urlsplit
+          for name in ("BRIER_DATA", "MODAL_DECIDE_URL", "META_API_KEY", "BRIER_INGEST_TOKEN", "BRIER_INGEST_URL"):
+              if not os.environ.get(name, "").strip():
+                  raise SystemExit(f"Robot CI requires {name}; no rollout was started")
+          if not os.environ["BRIER_DATA"].startswith("gs://"):
+              raise SystemExit("Robot CI requires a GCS BRIER_DATA snapshot")
+          if urlsplit(os.environ["MODAL_DECIDE_URL"]).scheme != "https":
+              raise SystemExit("MODAL_DECIDE_URL must be the deployed HTTPS endpoint")
+          ingest = urlsplit(os.environ["BRIER_INGEST_URL"])
+          if ingest.scheme != "https" or not ingest.netloc or ingest.path != "/api/ingest" or ingest.query or ingest.fragment or ingest.username:
+              raise SystemExit("BRIER_INGEST_URL must be the deployed HTTPS /api/ingest URL")
+          PY
+      - name: Require GCP identity configuration
+        if: vars.GCP_WORKLOAD_IDENTITY_PROVIDER == '' || vars.GCP_SERVICE_ACCOUNT == ''
+        run: |
+          echo '::error::Configure GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_SERVICE_ACCOUNT before running Robot CI'
+          exit 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Install CPU simulation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libgles2 libopengl0
+          pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .
+      - name: Fetch the frozen evaluation snapshot
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          (Path(os.environ["RUNNER_TEMP"]) / "brier-cloud-source.txt").write_text(os.environ["BRIER_DATA"].rstrip("/"))
+          PY
+          mkdir "$RUNNER_TEMP/brier-data"
+          for artifact in ledger.sqlite compiled.jsonl risk-calibration.json baseline-policy.yaml; do
+            gcloud storage cp "${BRIER_DATA%/}/$artifact" "$RUNNER_TEMP/brier-data/$artifact"
+          done
+          printf 'BRIER_DATA=%s\n' "$RUNNER_TEMP/brier-data" >> "$GITHUB_ENV"
+      - name: Validate baseline identity and run the cheap tier
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          from brier_sim.runner import run_episodes
+          from brier_sim.scenarios import scenarios
+
+          root = Path(os.environ["BRIER_DATA"])
+          inputs = Path(os.environ["RUNNER_TEMP"]) / "brier-ci"
+          binary = str(inputs / "brier")
+          card = json.loads((inputs / "card.json").read_text())
+          evidence = subprocess.check_output([binary, "card", "--before", str(root / "baseline-policy.yaml"),
+              "--after", str(inputs / "before.yaml"), "--change", card["change_id"]], text=True)
+          if not json.loads(evidence)["t0_identical"]:
+              raise SystemExit("The stored 50-episode baseline does not match the deployed policy identity")
+          definitions = scenarios(card["env"])
+          catalog = {"changes": [{"change_id": card["change_id"], "env": card["env"], "card": card["card"]}],
+                     "scenarios": definitions}
+          (root / "current-catalog.json").write_text(json.dumps(catalog) + "\n")
+          cheap = root / "cheap"
+          cheap.mkdir()
+          for scenario in definitions:
+              path = run_episodes(card["env"], card["policy"]["id"], 3, scenario["seeds"][0],
+                  card["change_id"], scenario["scenario_id"], "cheap", change=card["card"], scenario=scenario,
+                  revision=card["policy"]["revision"])
+              path.rename(cheap / f"{scenario['scenario_id']}.parquet")
+          subprocess.run([binary, "label", "--ledger", str(root / "ledger.sqlite"),
+              "--episodes", str(cheap), "--catalog", str(root / "current-catalog.json")], check=True)
+          with (root / "decisions.json").open("w") as target:
+              subprocess.run([binary, "decide", "--ledger", str(root / "ledger.sqlite"),
+                  "--compiled", str(root / "compiled.jsonl"), "--calibration", str(root / "risk-calibration.json"),
+                  "--change", card["change_id"]], stdout=target, check=True)
+          PY
+      - name: Run and label selected expensive evaluations
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          from brier_sim.runner import run_episodes
+          from brier_sim.scenarios import scenarios
+
+          root = Path(os.environ["BRIER_DATA"])
+          inputs = Path(os.environ["RUNNER_TEMP"]) / "brier-ci"
+          card = json.loads((inputs / "card.json").read_text())
+          decisions = json.loads((root / "decisions.json").read_text())["decisions"]
+          definitions = {scenario["scenario_id"]: scenario for scenario in scenarios(card["env"])}
+          expensive = root / "expensive"
+          expensive.mkdir()
+          for decision in decisions:
+              if decision["action"] == "skip":
+                  continue
+              if decision["action"] != "expensive":
+                  raise SystemExit(f"Unsupported requested action: {decision['action']}")
+              scenario = definitions[decision["scenario_id"]]
+              path = run_episodes(card["env"], card["policy"]["id"], 20, scenario["seeds"][0],
+                  card["change_id"], scenario["scenario_id"], "expensive", change=card["card"], scenario=scenario,
+                  revision=card["policy"]["revision"])
+              path.rename(expensive / f"{scenario['scenario_id']}.parquet")
+          if any(decision["action"] == "expensive" for decision in decisions):
+              subprocess.run([str(inputs / "brier"), "label", "--ledger", str(root / "ledger.sqlite"),
+                  "--episodes", str(expensive), "--catalog", str(root / "current-catalog.json")], check=True)
+          PY
+      - name: Explain every failed expensive episode
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sqlite3
+          import subprocess
+
+          root = Path(os.environ["BRIER_DATA"])
+          inputs = Path(os.environ["RUNNER_TEMP"]) / "brier-ci"
+          card = json.loads((inputs / "card.json").read_text())
+          with sqlite3.connect(root / "ledger.sqlite") as connection:
+              runs = connection.execute("SELECT run_id FROM runs WHERE change_id=? AND tier='expensive' AND episodes=20 AND successes<episodes ORDER BY scenario_id", (card["change_id"],)).fetchall()
+          explanations = []
+          for (run,) in runs:
+              result = subprocess.check_output([str(inputs / "brier"), "explain", "--ledger", str(root / "ledger.sqlite"), "--run", run], text=True)
+              explanations.append(json.loads(result))
+          (root / "explanations.json").write_text(json.dumps(explanations, indent=2) + "\n")
+          PY
+      - name: Publish recorded evidence before linking it
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          root = Path(os.environ["BRIER_DATA"])
+          source = (Path(os.environ["RUNNER_TEMP"]) / "brier-cloud-source.txt").read_text()
+          if (root / "public").is_dir():
+              subprocess.run(["gcloud", "storage", "cp", "--recursive", str(root / "public"), source + "/"], check=True)
+          (root / "published.json").write_text(json.dumps({"storage": source}) + "\n")
+          PY
+      - name: Write the check summary and verdict
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          root = Path(os.environ["BRIER_DATA"])
+          inputs = Path(os.environ["RUNNER_TEMP"]) / "brier-ci"
+          if not (root / "decisions.json").is_file():
+              raise SystemExit("No complete decision stage exists; Robot CI cannot report a pass")
+          card = json.loads((inputs / "card.json").read_text())
+          command = [str(inputs / "brier"), "report", "--ledger", str(root / "ledger.sqlite"),
+              "--change", card["change_id"], "--out", str(root / "report.md")]
+          published = root / "published.json"
+          environment = dict(os.environ)
+          if published.is_file():
+              environment["BRIER_DATA"] = json.loads(published.read_text())["storage"]
+              command += ["--push", os.environ["BRIER_INGEST_URL"]]
+          result = subprocess.run(command, env=environment, capture_output=True, text=True)
+          if result.stdout.strip():
+              (root / "report.json").write_text(json.dumps(json.loads(result.stdout), indent=2) + "\n")
+          if (root / "report.md").is_file():
+              with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as target:
+                  if not published.is_file():
+                      target.write("## Robot CI incomplete\n\nAn evaluation, explanation or evidence-publication stage failed. The diagnostic report below does not complete the CI gate.\n\n")
+                  target.write((root / "report.md").read_text())
+          if result.stderr:
+              print(result.stderr, end="")
+          if not published.is_file():
+              raise SystemExit("Robot CI did not complete all required stages")
+          raise SystemExit(result.returncode)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: robot-ci-results
+          path: ${{ runner.temp }}/brier-data
+          if-no-files-found: error
