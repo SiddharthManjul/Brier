@@ -155,7 +155,7 @@ fn parquet_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Atomically imports complete episode groups and computes their sole authoritative labels.
+/// Atomically imports complete tier groups, labelling only newly imported expensive results.
 pub fn label(ledger_path: &Path, episodes: &Path, catalog_path: &Path) -> Result<()> {
     let catalog: Catalog =
         serde_json::from_reader(File::open(catalog_path)?).context("read rollout catalog")?;
@@ -307,6 +307,10 @@ pub fn label(ledger_path: &Path, episodes: &Path, catalog_path: &Path) -> Result
             run.seeds.len() == count,
             "incomplete {change}/{scenario}/{tier}: expected {count} episodes"
         );
+        ensure!(
+            run.reward.is_finite() && run.seconds.is_finite(),
+            "nonfinite aggregate run statistics"
+        );
         if tier == "baseline" {
             ensure!(
                 baselines.insert(scenario.as_str(), run.successes).is_none(),
@@ -316,22 +320,86 @@ pub fn label(ledger_path: &Path, episodes: &Path, catalog_path: &Path) -> Result
             pairs.insert((change.as_str(), scenario.as_str()));
         }
     }
-    for (change, scenario) in &pairs {
-        ensure!(
-            baselines.contains_key(scenario),
-            "missing 50-episode baseline for {scenario}"
-        );
-        for tier in ["cheap", "expensive"] {
-            ensure!(
-                runs.contains_key(&(change.to_string(), scenario.to_string(), tier.to_string())),
-                "missing {tier} run for {change}/{scenario}"
-            );
-        }
-    }
     let mut connection =
         Connection::open_with_flags(ledger_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .context("open initialized ledger")?;
     let transaction = connection.transaction()?;
+    for scenario in baselines.keys() {
+        let count: i64 = transaction.query_row(
+            "SELECT count(*) FROM runs WHERE scenario_id=?1 AND tier='baseline'",
+            [scenario],
+            |row| row.get(0),
+        )?;
+        ensure!(count == 0, "baseline already imported for {scenario}");
+    }
+    for (change, scenario) in &pairs {
+        if !baselines.contains_key(scenario) {
+            let mut query = transaction.prepare(
+                "SELECT change_id,episodes,successes,mean_reward,wall_seconds FROM runs
+                 WHERE scenario_id=?1 AND tier='baseline'",
+            )?;
+            let existing = query
+                .query_map([scenario], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, f64>(3)?,
+                        row.get::<_, f64>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(
+                existing.len() == 1
+                    && existing[0].1 == 50
+                    && (0..=50).contains(&existing[0].2)
+                    && existing[0].3.is_finite()
+                    && existing[0].4.is_finite()
+                    && existing[0].4 >= 0.0,
+                "missing or invalid 50-episode baseline for {scenario}"
+            );
+            let (env, card): (String, String) = transaction
+                .query_row(
+                    "SELECT env,card_json FROM changes WHERE change_id=?1",
+                    [&existing[0].0],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .context("stored baseline change missing from ledger")?;
+            ensure!(
+                env == scenarios[scenario].env
+                    && family(&serde_json::from_str(&card)?)? == "benign",
+                "stored baseline metadata disagrees with scenario"
+            );
+            baselines.insert(*scenario, existing[0].2);
+        }
+        if runs.contains_key(&(change.to_string(), scenario.to_string(), "expensive".into()))
+            && !runs.contains_key(&(change.to_string(), scenario.to_string(), "cheap".into()))
+        {
+            let mut query = transaction.prepare(
+                "SELECT episodes,successes,mean_reward,wall_seconds FROM runs
+                 WHERE change_id=?1 AND scenario_id=?2 AND tier='cheap'",
+            )?;
+            let existing = query
+                .query_map([change, scenario], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, f64>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(
+                existing.len() == 1
+                    && existing[0].0 == 3
+                    && (0..=3).contains(&existing[0].1)
+                    && existing[0].2.is_finite()
+                    && existing[0].3.is_finite()
+                    && existing[0].3 >= 0.0,
+                "missing or invalid three-episode cheap run for {change}/{scenario}"
+            );
+        }
+    }
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_secs()
@@ -423,7 +491,10 @@ pub fn label(ledger_path: &Path, episodes: &Path, catalog_path: &Path) -> Result
         )?;
     }
     for (change, scenario) in pairs {
-        let run = &runs[&(change.to_string(), scenario.to_string(), "expensive".into())];
+        let Some(run) = runs.get(&(change.to_string(), scenario.to_string(), "expensive".into()))
+        else {
+            continue;
+        };
         let mode = (1..6)
             .max_by_key(|i| (run.failures[*i], std::cmp::Reverse(*i)))
             .unwrap();
