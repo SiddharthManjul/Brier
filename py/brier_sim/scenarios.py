@@ -141,7 +141,7 @@ def scenario_obs_hook(state: dict[str, Any], observation: Any) -> Any:
     def transform(value: np.ndarray, tensor: bool, key: str) -> np.ndarray:
         if value.ndim >= 3:
             if not state["aloha"] and state["params"]["lighting"] == "low":
-                value = value * 0.55
+                value = value * 0.95
             axes = (value.ndim - 2, value.ndim - 1) if tensor else (0, 1)
             for axis, offset in zip(axes, state["offset"], strict=True):
                 indices = np.clip(np.arange(value.shape[axis]) + offset, 0, value.shape[axis] - 1)
