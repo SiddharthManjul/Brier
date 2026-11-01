@@ -191,7 +191,7 @@ def test_scenario_obs_hook_has_fixed_translation_and_pusht_only_lighting() -> No
     observation = {"pixels": {"top": pixels}, "agent_pos": np.array([12.0, 34.0])}
     state = {"aloha": False, "params": {"lighting": "low"}, "offset": (1, -2)}
     first = scenario_obs_hook(state, observation)
-    expected = (np.pad(pixels * 0.55, ((2, 2), (2, 2), (0, 0)), mode="edge")[3:11, 0:8]).astype(np.uint8)
+    expected = (np.pad(pixels * 0.95, ((2, 2), (2, 2), (0, 0)), mode="edge")[3:11, 0:8]).astype(np.uint8)
     np.testing.assert_array_equal(first["pixels"]["top"], expected)
     np.testing.assert_array_equal(first["pixels"]["top"], scenario_obs_hook(state, observation)["pixels"]["top"])
     np.testing.assert_array_equal(first["agent_pos"], observation["agent_pos"])
@@ -219,7 +219,7 @@ def test_preprocessed_tensor_hooks_preserve_bchw_precision_and_raw_state() -> No
     observation = {"observation.images.top": image, "observation.state": torch.tensor([[12.0, 34.0]]), "unrelated_statistics": torch.tensor([0.5])}
     state = {"aloha": False, "params": {"lighting": "low"}, "offset": (1, -2)}
     transformed = scenario_obs_hook(state, observation)
-    expected = image[:, :, torch.tensor([1, 2, 3, 3]), :][:, :, :, torch.tensor([0, 0, 0, 1])] * 0.55
+    expected = image[:, :, torch.tensor([1, 2, 3, 3]), :][:, :, :, torch.tensor([0, 0, 0, 1])] * 0.95
     torch.testing.assert_close(transformed["observation.images.top"], expected)
     torch.testing.assert_close(transformed["observation.state"], observation["observation.state"])
     result = tier_obs_noise_hook(transformed, "expensive", np.random.default_rng(123))
