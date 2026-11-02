@@ -133,9 +133,25 @@ def test_segment_image_checks_key_prompt_and_actual_png_before_request(
     monkeypatch.setenv("META_API_KEY", "unit-test-key")
     with pytest.raises(ValueError, match="Rust-compiled"):
         sam.segment_image(path, " ")
-    Image.new("RGB", (8, 7)).save(path, format="JPEG")
+    Image.new("RGB", (8, 7)).save(path, format="GIF")
     with pytest.raises(ValueError, match="actual PNG"):
         sam.segment_image(path, "object")
+
+
+def test_segment_image_uses_actual_jpeg_media_type_without_reencoding(tmp_path, monkeypatch):
+    monkeypatch.setenv("META_API_KEY", "unit-test-key")
+    path = tmp_path / "frame.jpg"
+    Image.new("RGB", (8, 7)).save(path, format="JPEG")
+    sent = []
+
+    def completed(opener, message, **kwargs):
+        sent.append(json.loads(message.data))
+        return io.BytesIO(json.dumps(_body()).encode())
+
+    monkeypatch.setattr(sam.request.OpenerDirector, "open", completed)
+    assert len(sam.segment_image(path, "Rust object")) == 1
+    assert sent[0]["input"][0]["content"][1]["image_url"] == (
+        "data:image/jpeg;base64," + base64.b64encode(path.read_bytes()).decode())
 
 
 @pytest.mark.parametrize("dtype", [np.bool_, np.uint8, np.int64])
