@@ -11,7 +11,8 @@ from brier_ml.prepare import _scores, _training_receipt, prepare_bundle
 from brier_ml.t1 import train_t1
 
 
-def test_prepare_rejects_mutated_released_input_before_creating_bundle(tmp_path: Path) -> None:
+@pytest.mark.parametrize("changed", ["compiled.jsonl", "scenarios.jsonl"])
+def test_prepare_rejects_mutated_released_input_before_creating_bundle(tmp_path: Path, changed: str) -> None:
     dataset = tmp_path / "dataset"
     dataset.mkdir()
     names = ("ledger.sqlite", "compiled.jsonl", "episodes.jsonl", "changes.jsonl",
@@ -30,9 +31,9 @@ def test_prepare_rejects_mutated_released_input_before_creating_bundle(tmp_path:
     payload = json.dumps(receipt).encode()
     readiness = tmp_path / f"training-readiness-{hashlib.sha256(payload).hexdigest()}.json"
     readiness.write_bytes(payload)
-    (dataset / "compiled.jsonl").write_text("mutated")
+    (dataset / changed).write_text("mutated")
     output = tmp_path / "bundle"
-    with pytest.raises(ValueError, match="released input hash changed: compiled.jsonl"):
+    with pytest.raises(ValueError, match=f"released input hash changed: {changed}"):
         prepare_bundle(dataset, tmp_path / "runs", readiness, output, tmp_path / "brier",
                        training_receipt=tmp_path / "completion.json")
     assert not output.exists()
