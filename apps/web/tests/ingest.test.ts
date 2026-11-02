@@ -70,6 +70,26 @@ test("validateIngest rejects duplicate pair IDs and scenario IDs", () => {
   }
 });
 
+test("ingest rejects malformed model reports before they can break the dashboard", async (t) => {
+  const previous = process.env.BRIER_INGEST_TOKEN;
+  t.after(() => restore("BRIER_INGEST_TOKEN", previous));
+  process.env.BRIER_INGEST_TOKEN = "test-token";
+  for (const strategy of [
+    { test_metrics: { ece: "not measured" } },
+    { test_metrics: { reliability_bins: false } },
+    { guarantee_splits: 21 },
+  ]) {
+    const input = fixture();
+    Object.assign(input.report.body.strategies, { "Full cascade": strategy });
+    assert.throws(() => validateIngest(input));
+    const response = await POST(new Request("http://localhost/api/ingest", {
+      method: "POST", headers: { authorization: "Bearer test-token" },
+      body: JSON.stringify(input),
+    }));
+    assert.equal(response.status, 400);
+  }
+});
+
 test("validateIngest requires HTTPS media URLs without credentials", () => {
   for (const address of ["javascript:alert(1)", "http://example.com/frame.png",
     "https://user:secret@example.com/frame.png"]) {
