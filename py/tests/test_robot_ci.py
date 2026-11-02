@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import runpy
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -32,8 +33,19 @@ def _bundle(directory: Path) -> dict:
     t1 = {"model_version": "t1@" + "c" * 64, "calibration_change_ids": fit, "training_change_ids": training}
     risk = {"model_version": version, "t1": t1, "probability_calibration_change_ids": fit,
             "changes": [{"change_id": identity} for identity in held]}
-    contents = {"ledger.sqlite": b"actual-test-ledger",
+    definitions = [{"scenario_id": f"{env}-s{index:02}", "env": env, "seeds": list(range(index * 50, (index + 1) * 50)),
+                    "baseline_success": .8, "params": {"pose_bin": (index - 1) // 4 + 1, "lighting": "normal",
+                                                        "camera_jitter": False, **({"physics_jitter": False} if env == "aloha" else {})}}
+                   for env in ("pusht", "aloha") for index in range(1, 17)]
+    ledger = directory / "ledger.sqlite"
+    with sqlite3.connect(ledger) as connection:
+        connection.execute("CREATE TABLE scenarios(scenario_id TEXT,env TEXT,params_json TEXT,baseline_success REAL)")
+        connection.executemany("INSERT INTO scenarios VALUES(?,?,?,?)", [
+            (row["scenario_id"], "gym_pusht/PushT-v0" if row["env"] == "pusht" else "gym_aloha/AlohaTransferCube-v0",
+             json.dumps(row["params"]), row["baseline_success"]) for row in definitions])
+    contents = {"ledger.sqlite": ledger.read_bytes(),
                 "compiled.jsonl": "".join(json.dumps(row) + "\n" for row in compiled).encode(),
+                "scenarios.jsonl": "".join(json.dumps(row) + "\n" for row in definitions).encode(),
                 "risk-calibration.json": json.dumps(risk).encode(), "t1.json": json.dumps(t1).encode(),
                 "replay-scores.json": b'{}\n', "report.json": b'{}\n', "baseline-policy.yaml": b"env: pusht\n",
                 "aloha-baseline-policy.yaml": b"env: aloha\n"}
@@ -42,6 +54,7 @@ def _bundle(directory: Path) -> dict:
     files = {name: hashlib.sha256(data).hexdigest() for name, data in contents.items()}
     return {"schema": "brier-decision-bundle-v1", "files": files, "model_version": version,
             "data_sha256": files["compiled.jsonl"],
+            "release_hashes": {"scenarios.jsonl": files["scenarios.jsonl"]},
             "training_completion_sha256": "d" * 64,
             "calibration_partition": {"fit_change_ids": fit, "risk_change_ids": held}}
 
