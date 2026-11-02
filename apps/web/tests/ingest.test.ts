@@ -78,6 +78,12 @@ test("ingest rejects malformed model reports before they can break the dashboard
     { test_metrics: { ece: "not measured" } },
     { test_metrics: { reliability_bins: false } },
     { guarantee_splits: 21 },
+    { eval_hours_saved: "pending" },
+    { missed_regression_fraction: false },
+    { change_recall: 1.1 },
+    { p50_latency_seconds: -1 },
+    { p95_latency_seconds: "unmeasured" },
+    { cost_usd_per_change: -1 },
   ]) {
     const input = fixture();
     Object.assign(input.report.body.strategies, { "Full cascade": strategy });
@@ -163,4 +169,24 @@ test("POST awaits one scoped batch with equivalent replay statements", async (t)
   const failed = await POST(request());
   assert.equal(failed.status, 500);
   assert.equal(JSON.stringify(await failed.json()).includes("hidden-database-secret"), false);
+});
+
+test("ingest accepts both ALOHA scenario aliases without weakening environment matching", () => {
+  for (const scenarioId of ["aloha-s01", "aloha_transfer_cube-s01"]) {
+    const input = fixture();
+    input.change.env = "aloha_transfer_cube";
+    input.pairs[0].scenarioId = scenarioId;
+    assert.equal(validateIngest(input).pairs[0].scenarioId, scenarioId);
+  }
+  for (const [env, scenarioId] of [
+    ["pusht", "aloha-s01"], ["pusht", "aloha_transfer_cube-s01"],
+    ["aloha_transfer_cube", "pusht-s01"], ["aloha_transfer_cube", "aloha-s00"],
+    ["aloha_transfer_cube", "aloha-s1"], ["aloha_transfer_cube", "aloha-s001"],
+    ["aloha_transfer_cube", "aloha_transfer_cube-s00"], ["aloha_transfer_cube", "aloha-s0x"],
+  ]) {
+    const input = fixture();
+    input.change.env = env;
+    input.pairs[0].scenarioId = scenarioId;
+    assert.throws(() => validateIngest(input), /scenarioId/);
+  }
 });
