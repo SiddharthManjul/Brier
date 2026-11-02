@@ -10,7 +10,7 @@ use anyhow::{bail, ensure, Context, Result};
 use brier_core::ledger;
 use parquet::{
     file::reader::{FileReader, SerializedFileReader},
-    record::RowAccessor,
+    record::{Field, Row, RowAccessor},
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize};
@@ -57,6 +57,7 @@ struct Run {
     seconds: f64,
     failures: [usize; 6],
     uris: BTreeSet<PathBuf>,
+    guide: Option<bool>,
 }
 
 fn family(card: &Value) -> Result<String> {
@@ -68,7 +69,8 @@ fn family(card: &Value) -> Result<String> {
         "card needs one or two families"
     );
     ensure!(
-        card["description"]
+        card.get("desc")
+            .unwrap_or(&card["description"])
             .as_str()
             .is_some_and(|s| !s.trim().is_empty() && !s.contains(['\n', '\r'])),
         "card description must be one nonempty line"
@@ -178,6 +180,15 @@ pub fn label(ledger_path: &Path, episodes: &Path, catalog_path: &Path) -> Result
     );
     for change in changes.values() {
         family(&change.card)?;
+        if change.card.get("desc").is_some() {
+            ensure!(
+                change.card.as_object().is_some_and(|card| card.len() == 5)
+                    && change.card["change_id"] == change.change_id
+                    && guide_env(change.card["env"].as_str().unwrap_or(""))? == change.env
+                    && change.card["seed"].as_u64().is_some(),
+                "Guide live card identity differs from catalog"
+            );
+        }
     }
     for scenario in scenarios.values() {
         ensure!(
@@ -203,6 +214,48 @@ pub fn label(ledger_path: &Path, episodes: &Path, catalog_path: &Path) -> Result
         for row in reader.get_row_iter(None)? {
             let row = row?;
             let names: Vec<_> = row.get_column_iter().map(|(n, _)| n.as_str()).collect();
+            if names == GUIDE_FIELDS.split_whitespace().collect::<Vec<_>>() {
+                let episode = guide_parquet(&row)?;
+                let change = changes
+                    .get(episode.change_id.as_str())
+                    .context("Guide episode change absent from catalog")?;
+                let scenario = scenarios
+                    .get(episode.scenario_id.as_str())
+                    .context("Guide episode scenario absent from catalog")?;
+                let count = match episode.tier.as_str() {
+                    "cheap" => 3,
+                    "expensive" => 20,
+                    _ => bail!("Guide live import only accepts cheap or expensive groups"),
+                };
+                ensure!(
+                    change.card.get("desc").is_some()
+                        && guide_env(&episode.env)? == change.env
+                        && change.env == scenario.env
+                        && episode.episode_idx < count
+                        && scenario.seeds[episode.episode_idx] == episode.seed,
+                    "Guide live episode identity or seed differs from frozen catalog"
+                );
+                let mode = guide_mode(&episode)?;
+                let run = runs
+                    .entry((episode.change_id, episode.scenario_id, episode.tier))
+                    .or_default();
+                ensure!(
+                    run.guide.is_none_or(|guide| guide),
+                    "mixed Guide and legacy episode schemas"
+                );
+                run.guide = Some(true);
+                ensure!(
+                    run.seeds.insert(episode.seed),
+                    "duplicate episode seed in a change/scenario/tier group"
+                );
+                run.successes += i64::from(episode.success);
+                run.reward += episode.reward_sum;
+                run.seconds += episode.wall_seconds;
+                run.failures[mode] += 1;
+                run.uris.insert(path.clone());
+                row_count += 1;
+                continue;
+            }
             ensure!(
                 names
                     == [
@@ -286,6 +339,11 @@ pub fn label(ledger_path: &Path, episodes: &Path, catalog_path: &Path) -> Result
                 ))
                 .or_default();
             ensure!(
+                run.guide.is_none_or(|guide| !guide),
+                "mixed Guide and legacy episode schemas"
+            );
+            run.guide = Some(false);
+            ensure!(
                 run.seeds.insert(seed),
                 "duplicate episode seed in a change/scenario/tier group"
             );
@@ -338,7 +396,7 @@ pub fn label(ledger_path: &Path, episodes: &Path, catalog_path: &Path) -> Result
     for (change, scenario) in &pairs {
         if !baselines.contains_key(scenario) {
             let mut query = transaction.prepare(
-                "SELECT change_id,episodes,successes,mean_reward,wall_seconds FROM runs
+                "SELECT change_id,episodes,successes,mean_reward,wall_seconds,run_id,uri FROM runs
                  WHERE scenario_id=?1 AND tier='baseline'",
             )?;
             let existing = query
@@ -349,6 +407,8 @@ pub fn label(ledger_path: &Path, episodes: &Path, catalog_path: &Path) -> Result
                         row.get::<_, i64>(2)?,
                         row.get::<_, f64>(3)?,
                         row.get::<_, f64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -361,18 +421,42 @@ pub fn label(ledger_path: &Path, episodes: &Path, catalog_path: &Path) -> Result
                     && existing[0].4 >= 0.0,
                 "missing or invalid 50-episode baseline for {scenario}"
             );
-            let (env, card): (String, String) = transaction
-                .query_row(
-                    "SELECT env,card_json FROM changes WHERE change_id=?1",
-                    [&existing[0].0],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .context("stored baseline change missing from ledger")?;
-            ensure!(
-                env == scenarios[scenario].env
-                    && family(&serde_json::from_str(&card)?)? == "benign",
-                "stored baseline metadata disagrees with scenario"
-            );
+            if existing[0].0 == "base" {
+                let env = match scenarios[scenario].env.as_str() {
+                    "gym_pusht/PushT-v0" => "pusht",
+                    "gym_aloha/AlohaTransferCube-v0" => "aloha",
+                    _ => bail!("unsupported Guide 1 baseline environment"),
+                };
+                let key = format!("base:{scenario}:baseline");
+                let base_changes: i64 = transaction.query_row(
+                    "SELECT count(*) FROM changes WHERE change_id='base'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                ensure!(
+                    base_changes == 0
+                        && scenario.starts_with(&format!("{env}-s"))
+                        && existing[0].5
+                            == Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()).to_string()
+                        && existing[0].6.ends_with(&format!(
+                            "/episodes/env={env}/tier=baseline/change=base/{scenario}.parquet"
+                        )),
+                    "stored Guide 1 baseline identity disagrees with scenario"
+                );
+            } else {
+                let (env, card): (String, String) = transaction
+                    .query_row(
+                        "SELECT env,card_json FROM changes WHERE change_id=?1",
+                        [&existing[0].0],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .context("stored baseline change missing from ledger")?;
+                ensure!(
+                    env == scenarios[scenario].env
+                        && family(&serde_json::from_str(&card)?)? == "benign",
+                    "stored baseline metadata disagrees with scenario"
+                );
+            }
             baselines.insert(*scenario, existing[0].2);
         }
         if runs.contains_key(&(change.to_string(), scenario.to_string(), "expensive".into()))
@@ -498,28 +582,105 @@ pub fn label(ledger_path: &Path, episodes: &Path, catalog_path: &Path) -> Result
         else {
             continue;
         };
-        let mode = (1..6)
-            .max_by_key(|i| (run.failures[*i], std::cmp::Reverse(*i)))
-            .unwrap();
+        let regressed = 5 * run.successes < 2 * baselines[scenario] - 15;
+        let guide = run.guide == Some(true);
+        let priority = if guide {
+            [2, 1, 3, 4, 5]
+        } else {
+            [1, 2, 3, 4, 5]
+        };
+        let mode = *priority
+            .iter()
+            .enumerate()
+            .max_by_key(|(rank, mode)| (run.failures[**mode], std::cmp::Reverse(*rank)))
+            .unwrap()
+            .1;
+        let cause = if guide {
+            changes[change].card["families"][0]["family"]
+                .as_str()
+                .context("missing first Guide cause family")?
+                .to_owned()
+        } else {
+            family(&changes[change].card)?
+        };
         ledger::insert_label(
             &transaction,
             &ledger::Label {
                 change_id: change,
                 scenario_id: scenario,
-                regressed: 5 * run.successes < 2 * baselines[scenario] - 15,
-                failure_mode: if run.successes == 20 {
+                regressed,
+                failure_mode: if run.successes == 20 || guide && !regressed {
                     MODES[0]
                 } else {
                     MODES[mode]
                 },
-                success_bucket: ((run.successes + 3) / 4).max(1),
-                cause_family: &family(&changes[change].card)?,
+                success_bucket: if guide {
+                    (run.successes / 4 + 1).min(5)
+                } else {
+                    ((run.successes + 3) / 4).max(1)
+                },
+                cause_family: &cause,
             },
         )?;
     }
     transaction
         .commit()
         .context("commit labeled episode import")
+}
+
+const GUIDE_FIELDS: &str = "env policy_repo policy_revision change_id scenario_id tier episode_idx seed success steps max_steps reward_sum max_reward final_reward coverage_final coverage_max block_disp_px touched_right touched_left lifted table_contact_steps action_flip_rate terminal_state_json keyframes_uri wall_seconds lerobot_version code_commit host";
+
+fn guide_parquet(row: &Row) -> Result<GuideEpisode> {
+    let mut values = serde_json::Map::new();
+    for (name, field) in row.get_column_iter() {
+        let value = match field {
+            Field::Null => Value::Null,
+            Field::Bool(value) => Value::Bool(*value),
+            Field::Int(value) => Value::from(*value),
+            Field::Long(value) => Value::from(*value),
+            Field::Double(value) => Value::Number(
+                serde_json::Number::from_f64(*value).context("nonfinite Guide episode value")?,
+            ),
+            Field::Str(value) => Value::String(value.clone()),
+            _ => bail!("unexpected Guide episode field type"),
+        };
+        values.insert(name.clone(), value);
+    }
+    let source = Value::Object(values);
+    let env = source["env"]
+        .as_str()
+        .context("missing Guide environment")?;
+    let expected_policy = match env {
+        "pusht" => "lerobot/diffusion_pusht",
+        "aloha" => "lerobot/act_aloha_sim_transfer_cube_human",
+        _ => bail!("unsupported Guide environment"),
+    };
+    let hex = |key: &str| {
+        source[key].as_str().is_some_and(|value| {
+            value.len() == 40
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    };
+    ensure!(
+        source["policy_repo"] == expected_policy
+            && hex("policy_revision")
+            && hex("code_commit")
+            && source["lerobot_version"] == "0.3.3"
+            && source["host"].as_str().is_some_and(|host| !host.is_empty()),
+        "invalid Guide policy or source provenance"
+    );
+    let terminal: Value = serde_json::from_str(
+        source["terminal_state_json"]
+            .as_str()
+            .context("missing Guide terminal state")?,
+    )?;
+    ensure!(
+        terminal.is_object(),
+        "Guide terminal state must be an object"
+    );
+    serde_json::from_value(source).context("invalid Guide episode fields")
 }
 
 #[derive(Deserialize)]
