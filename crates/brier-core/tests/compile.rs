@@ -120,6 +120,88 @@ fn fixture() -> Fixture {
 }
 
 #[test]
+fn adaptive_live_compilation_needs_no_fake_cheap_evidence() {
+    let f = fixture();
+    let (_, _) = f.compile("frozen.jsonl");
+    let frozen = f.directory.join("frozen.jsonl");
+    let card = json!({"change_id":"c998","env":"pusht","families":latency(2),"desc":"Move inference","seed":2027});
+    f.connection
+        .execute(
+            "INSERT INTO changes VALUES('c998','gym_pusht/PushT-v0',?1,'now')",
+            [card.to_string()],
+        )
+        .unwrap();
+    let noev =
+        brier_core::compile::compile_live_variant(&f.ledger, "c998", &frozen, false).unwrap();
+    assert_eq!(noev.len(), 1);
+    assert!(noev[0]
+        .questions
+        .iter()
+        .all(|q| q["id"].as_str().unwrap().ends_with("/no_cheap")
+            && q["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("CHEAP_TIER: not run")));
+    assert!(
+        brier_core::compile::compile_live_variant(&f.ledger, "c998", &frozen, true)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(brier_core::compile::compile_live(&f.ledger, "c998", &frozen).is_err());
+    f.connection
+        .execute(
+            "INSERT INTO runs VALUES('live-cheap','c998','pusht-s01','cheap',3,1,0.4,'raw',1)",
+            [],
+        )
+        .unwrap();
+    let ev = brier_core::compile::compile_live_variant(&f.ledger, "c998", &frozen, true).unwrap();
+    assert_eq!(ev.len(), 1);
+    assert!(ev[0].questions[0]["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("CHEAP_TIER: success=1/3"));
+    assert_eq!(
+        serde_json::to_value(noev).unwrap(),
+        serde_json::to_value(
+            brier_core::compile::compile_live_variant(&f.ledger, "c998", &frozen, false).unwrap()
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn heldout_extension_preserves_original_rows_and_never_adds_training() {
+    let f = fixture();
+    let (_, original) = f.compile("original.jsonl");
+    f.add("c161", "pusht", latency(2), true);
+    f.add(
+        "c162",
+        "pusht",
+        json!([{"family":"occlusion","params":{"fraction":0.1}}]),
+        true,
+    );
+    let out = f.directory.join("extended.jsonl");
+    brier_core::compile::compile_heldout(&f.ledger, &out, Some("c161")).unwrap();
+    let rows = fs::read_to_string(out)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str::<Value>(s).unwrap())
+        .collect::<Vec<_>>();
+    for row in original {
+        assert!(rows.contains(&row), "original row changed: {}", row["id"]);
+    }
+    for row in rows.iter().filter(|r| r["change_id"] == "c161") {
+        assert_eq!(row["split"], "calibration");
+    }
+    for row in rows.iter().filter(|r| r["change_id"] == "c162") {
+        assert_eq!(row["split"], "ood");
+    }
+    let invalid = f.directory.join("invalid.jsonl");
+    assert!(brier_core::compile::compile_heldout(&f.ledger, &invalid, Some("c100")).is_err());
+    assert!(!invalid.exists());
+}
+
+#[test]
 fn guide_metadata_sha_splits_shuffling_labels_and_counts_are_stable() {
     let f = fixture();
     let (first, rows) = f.compile("first.jsonl");
