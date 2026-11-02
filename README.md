@@ -55,7 +55,7 @@ Guide 2 has a separate dependency manifest in [py/pyproject.toml](py/pyproject.t
 
 ## Reproduce a measured replay
 
-The verified source release remains private at `gs://brier_bucket/release/v1`; its measured dataset card is `data/rollout-v1/DATASET_CARD.md`. The prepared local decision bundle is `data/decision-v1`, containing checksummed copies of the ledger and compiled states, fitted T1, the exact trained adapter identity, three temperatures, the independent seven-fit/nineteen-risk partition, risk calibration, both frozen policy baselines and the measured replay report. Nothing is publicly published. Set `BRIER_DATA` to this existing **local** bundle directory, or a separately prepared directory containing:
+The verified source release remains private at `gs://brier_bucket/release/v1`; its measured dataset card is `data/rollout-v1/DATASET_CARD.md`. The prepared local decision bundle is `data/decision-v1-audited`, containing checksummed copies of the ledger, compiled states and frozen scenario catalog, fitted T1, the exact trained adapter identity, three temperatures, the independent seven-fit/nineteen-risk partition, risk calibration, both frozen policy baselines and the measured replay report. Nothing is publicly published. Set `BRIER_DATA` to this existing **local** bundle directory, or a separately prepared directory containing:
 
 | File | Required contents |
 | --- | --- |
@@ -81,7 +81,7 @@ cargo run --locked --bin brier -- replay \
   --out "$BRIER_DATA/report.json"
 ```
 
-Defaults are `--alpha 0.05 --seed 0`. The prepared `data/decision-v1` bundle already contains `report.json`; use the separate `recheck-report.json` example below to reproduce it without overwriting an artifact. Replay reads actual labels and durations, adds run-all, cheap-heuristic, and random-at-equal-expected-budget baselines, and reports only supplied scored strategies. Primary ablation metrics, costs, reliability bins, and threshold curves use the test cohort; OOD calibration is reported separately. The JSON includes measured hours, change recall, ECE, Brier score, NLL, AUROC when defined, and twenty seeded split results. Persisted held-out explanations can also be scored for top-one/top-two injected-family agreement without exposing the hidden family to the provider. ECE uses fifteen quantile bins with tied scores kept together. API/GPU cost and latency appear only when provided as measurements.
+Defaults are `--alpha 0.05 --seed 0`. The prepared `data/decision-v1-audited` bundle already contains `report.json`; use the separate `recheck-report.json` example below to reproduce it without overwriting an artifact. Replay reads actual labels and durations, adds run-all, cheap-heuristic, and random-at-equal-expected-budget baselines, and reports only supplied scored strategies. Primary ablation metrics, costs, reliability bins, and threshold curves use the test cohort; OOD calibration is reported separately. The JSON includes measured hours, change recall, ECE, Brier score, NLL, AUROC when defined, and twenty seeded split results. Persisted held-out explanations can also be scored for top-one/top-two injected-family agreement without exposing the hidden family to the provider. ECE uses fifteen quantile bins with tied scores kept together. API/GPU cost and latency appear only when provided as measurements.
 
 For artifact preparation and live decisions, inspect the implemented interfaces:
 
@@ -136,11 +136,11 @@ Local checks without provider calls or deployments:
 
 ```sh
 make check
-BRIER_DATA="$PWD/data/decision-v1" cargo run --locked --bin brier -- replay \
-  --ledger "$PWD/data/decision-v1/ledger.sqlite" \
-  --compiled "$PWD/data/decision-v1/compiled.jsonl" \
-  --scores "$PWD/data/decision-v1/replay-scores.json" \
-  --out "$PWD/data/decision-v1/recheck-report.json"
+BRIER_DATA="$PWD/data/decision-v1-audited" cargo run --locked --bin brier -- replay \
+  --ledger "$PWD/data/decision-v1-audited/ledger.sqlite" \
+  --compiled "$PWD/data/decision-v1-audited/compiled.jsonl" \
+  --scores "$PWD/data/decision-v1-audited/replay-scores.json" \
+  --out "$PWD/data/decision-v1-audited/recheck-report.json"
 pnpm --dir apps/web dev
 ```
 
@@ -159,7 +159,25 @@ PYTHONPATH=py .venv/bin/python -m brier_ml.prepare \
 
 After separately approving provider/GPU testing, verify `/decide` against held-out Rust-compiled questions and its exact bundle model version, then run one genuine `explain` request against saved failure frames. Configure `DATABASE_URL` and `BRIER_INGEST_TOKEN` in the app environment, and send an actual `brier report --push` bundle to its `/api/ingest` route. Inspect all four pages against the ingested rows. These checks need real service access; passing local fixtures is not reported as passing them.
 
-The prepared Robot CI workflow fetches the decision bundle, verifies every named file checksum, checks the model and separate fit/risk provenance, and selects the matching PushT or ALOHA frozen baseline before any rollout. Its live report includes the measured replay metrics. The checked-in policy template deliberately has `revision: null`: replace it with the actual deployed immutable policy snapshot only when running real Robot CI is approved. Do not dispatch the workflow merely to preview the frontend.
+The prepared Robot CI workflow fetches the decision bundle, verifies every named file checksum including the frozen scenario IDs and seed catalog, checks the model and separate fit/risk provenance, and selects the matching PushT or ALOHA frozen baseline before any rollout. Its live report includes the measured replay metrics. The checked-in policy template deliberately has `revision: null`: replace it with the actual deployed immutable policy snapshot only when running real Robot CI is approved. Do not dispatch the workflow merely to preview the frontend.
+
+## Implementation audit, November 2
+
+The four-page application and Robot CI source are implemented, with local contract tests. Credential-backed acceptance is still pending. This is not a claim that the entire submission is finished.
+
+Audit checks passed: `make check` (126 Rust, 492 root Python and 15 web tests, plus lint, typecheck and production build); 224 separate Guide 1 tests; 310 separate Guide 2 CPU tests. Rust reproduced all 15,360 frozen training records byte for byte. A temporary-fixture cross-stage probe covered all sixteen scenarios in each environment through decisions, reports and web ingest validation; its scoring endpoint was local and its episodes deterministic fixtures, so it is not evidence of live provider behavior. The fresh private `data/decision-v1-audited` bundle verifies all nine file hashes, including the frozen scenario catalog; the prior bundle and released dataset are preserved.
+
+| Area | Current evidence | Remaining acceptance |
+| --- | --- | --- |
+| Dataset, Rust labels/prompts, trained model | Independently verified private release; one epoch, 249 steps; exact adapter and seven-fit/nineteen-risk partition | No new training or data changes are required for integration testing. |
+| Four web pages and ingest | Responsive scoped design, atomic ingest contract and measured-report validation | Apply the existing migration to a development Neon database; ingest actual rows and inspect the populated pages. |
+| Native Robot CI and failure evidence | Frozen scenario IDs/seeds, native evaluation semantics, staged imports, raw frame/mask contracts and PR metadata | Real vLLM LoRA load, Muse/SAM requests and a complete policy PR run have not been exercised. |
+| Model acceptance | Full cascade: test ECE 0.128743, 0% hours saved, 18/20 diagnostic splits. Fine-tuned-only: ECE 0.150758, 28.66% hours saved, 15/20 splits. Cheap heuristic: 1.30% hours saved. | ECE target fails. The cascade does not beat the heuristic on savings. The alternate row is not a replacement selected from held-out results. Explainer top-two accuracy is unmeasured. |
+| Demo and submission | Source, private artifacts and setup instructions are prepared | Three actual timed PR demos, public evidence permissions, deployed services and the recorded three-minute video remain unfinished. Deployment and publication stay on hold. |
+
+Future live evaluations use the same native Guide 1 rollout path and pinned policies as collection. Guide-native policy parameters are `s` for action scale, `b` for action bias, `shift`/`angle` for camera shift and `fraction` for occlusion; the other family parameter names are unchanged. The workflow does not silently reinterpret legacy `scale`, `drift`, `dx`/`dy` or rectangle parameters as these trained semantics. The frozen release and existing trained artifacts remain unchanged.
+
+The PDF's sign-in, onboarding, Scenarios and Settings workflows remain deferred under the user's four-page scope decision. A missing demo recording is not replaced with a fabricated video or sample evaluation.
 
 ## Platform and results
 
@@ -167,7 +185,7 @@ The Node-runtime app in `apps/web` has `/`, `/runs`, `/runs/[id]`, `/models`, an
 
 The frontend follows the supplied design within the frozen four-page scope; sign-in, onboarding, Scenarios and Settings remain outside this build. Missing measurements display as pending. The `/models` table and charts consume actual ingested Robot reports. Private local artifacts are ready for integration; public image access, dataset/adapter publication, hosted deployment and a demo video remain on hold.
 
-Software CI tasks T26/T27 remain gated on the Nov 2 Robot acceptance checklist: test ECE at most 0.05; better evaluation-hour savings than the cheap heuristic at `alpha = 0.05`; at least eighteen of twenty replay splits within target; all three end-to-end PR demos under fifteen minutes each; and explainer top-two accuracy above sixty percent. These are unverified targets. No Software adapter or platform tab is presented as available.
+Software CI tasks T26/T27 remain gated on the Nov 2 Robot acceptance checklist: test ECE at most 0.05; better evaluation-hour savings than the cheap heuristic at `alpha = 0.05`; at least eighteen of twenty replay splits within target; all three end-to-end PR demos under fifteen minutes each; and explainer top-two accuracy above sixty percent. The measured ECE and cascade-savings gates fail; live-demo and explainer gates remain unverified. No Software adapter or platform tab is presented as available.
 
 ## Built during the hackathon
 
