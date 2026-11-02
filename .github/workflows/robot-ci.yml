@@ -163,10 +163,61 @@ jobs:
           (Path(os.environ["RUNNER_TEMP"]) / "brier-cloud-source.txt").write_text(os.environ["BRIER_DATA"].rstrip("/"))
           PY
           mkdir "$RUNNER_TEMP/brier-data"
-          for artifact in ledger.sqlite compiled.jsonl risk-calibration.json baseline-policy.yaml; do
+          for artifact in bundle-manifest.json ledger.sqlite compiled.jsonl risk-calibration.json t1.json replay-scores.json report.json baseline-policy.yaml aloha-baseline-policy.yaml; do
             gcloud storage cp "${BRIER_DATA%/}/$artifact" "$RUNNER_TEMP/brier-data/$artifact"
           done
           printf 'BRIER_DATA=%s\n' "$RUNNER_TEMP/brier-data" >> "$GITHUB_ENV"
+      - name: Verify the prepared decision bundle before evaluation
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          from brier_ml.dataset import _compiled_rows
+          from brier_ml.glimmer_data import calibration_partition
+
+          root = Path(os.environ["BRIER_DATA"])
+          manifest = json.loads((root / "bundle-manifest.json").read_text())
+          required = {"ledger.sqlite", "compiled.jsonl", "risk-calibration.json", "t1.json", "replay-scores.json",
+                      "report.json", "baseline-policy.yaml", "aloha-baseline-policy.yaml"}
+          if manifest.get("schema") != "brier-decision-bundle-v1" or set(manifest.get("files", {})) != required:
+              raise SystemExit("Robot CI requires the complete checksummed decision bundle")
+          if not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("training_completion_sha256"))):
+              raise SystemExit("Decision bundle must bind the immutable training-completion receipt")
+          for name, digest in manifest["files"].items():
+              if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                  raise SystemExit(f"Invalid bundle checksum for {name}")
+              with (root / name).open("rb") as stream:
+                  actual = hashlib.file_digest(stream, "sha256").hexdigest()
+              if actual != digest:
+                  raise SystemExit(f"Decision bundle checksum mismatch: {name}")
+          if manifest.get("data_sha256") != manifest["files"]["compiled.jsonl"]:
+              raise SystemExit("Decision bundle does not bind the compiled dataset")
+          risk = json.loads((root / "risk-calibration.json").read_text())
+          partition = manifest.get("calibration_partition", {})
+          fit, held = partition.get("fit_change_ids", []), partition.get("risk_change_ids", [])
+          if (not isinstance(fit, list) or not isinstance(held, list) or len(fit) != 7 or len(held) != 19
+                  or not all(isinstance(value, str) and re.fullmatch(r"c[0-9]{3,}", value) for value in fit + held)
+                  or len(set(fit + held)) != 26):
+              raise SystemExit("Decision bundle must preserve the independent seven-fit/nineteen-risk partition")
+          compiled = _compiled_rows(root / "compiled.jsonl")
+          expected_fit, expected_held = calibration_partition(row["change"] for row in compiled
+                                                              if row["split"] == "calibration")
+          training = sorted({row["change"] for row in compiled if row["split"] == "train"})
+          if (fit != expected_fit or held != expected_held
+                  or risk.get("t1", {}).get("calibration_change_ids") != fit
+                  or risk.get("t1", {}).get("training_change_ids") != training):
+              raise SystemExit("Decision bundle fitting pools differ from the frozen compiled changes")
+          if (risk.get("model_version") != manifest.get("model_version")
+                  or not re.fullmatch(r"[^\s@]+@[0-9a-f]{40}\+lora@[0-9a-f]{64}", str(manifest.get("model_version")))
+                  or risk.get("t1") != json.loads((root / "t1.json").read_text())
+                  or sorted(risk.get("probability_calibration_change_ids", [])) != sorted(fit)
+                  or sorted(change["change_id"] for change in risk.get("changes", [])) != sorted(held)):
+              raise SystemExit("Decision bundle model and calibration provenance disagree")
+          PY
       - name: Validate baseline identity and run the cheap tier
         run: |
           python - <<'PY'
@@ -181,7 +232,9 @@ jobs:
           inputs = Path(os.environ["RUNNER_TEMP"]) / "brier-ci"
           binary = str(inputs / "brier")
           card = json.loads((inputs / "card.json").read_text())
-          evidence = subprocess.check_output([binary, "card", "--before", str(root / "baseline-policy.yaml"),
+          baselines = {"gym_pusht/PushT-v0": "baseline-policy.yaml",
+                       "gym_aloha/AlohaTransferCube-v0": "aloha-baseline-policy.yaml"}
+          evidence = subprocess.check_output([binary, "card", "--before", str(root / baselines[card["env"]]),
               "--after", str(inputs / "before.yaml"), "--change", card["change_id"]], text=True)
           if not json.loads(evidence)["t0_identical"]:
               raise SystemExit("The stored 50-episode baseline does not match the deployed policy identity")
@@ -283,7 +336,8 @@ jobs:
               raise SystemExit("No complete decision stage exists; Robot CI cannot report a pass")
           card = json.loads((inputs / "card.json").read_text())
           command = [str(inputs / "brier"), "report", "--ledger", str(root / "ledger.sqlite"),
-              "--change", card["change_id"], "--out", str(root / "report.md")]
+              "--change", card["change_id"], "--out", str(root / "report.md"),
+              "--metrics", str(root / "report.json")]
           published = root / "published.json"
           environment = dict(os.environ)
           if published.is_file():
