@@ -163,7 +163,7 @@ jobs:
           (Path(os.environ["RUNNER_TEMP"]) / "brier-cloud-source.txt").write_text(os.environ["BRIER_DATA"].rstrip("/"))
           PY
           mkdir "$RUNNER_TEMP/brier-data"
-          for artifact in bundle-manifest.json ledger.sqlite compiled.jsonl risk-calibration.json t1.json replay-scores.json report.json baseline-policy.yaml aloha-baseline-policy.yaml; do
+          for artifact in bundle-manifest.json ledger.sqlite compiled.jsonl scenarios.jsonl risk-calibration.json t1.json replay-scores.json report.json baseline-policy.yaml aloha-baseline-policy.yaml; do
             gcloud storage cp "${BRIER_DATA%/}/$artifact" "$RUNNER_TEMP/brier-data/$artifact"
           done
           printf 'BRIER_DATA=%s\n' "$RUNNER_TEMP/brier-data" >> "$GITHUB_ENV"
@@ -175,13 +175,14 @@ jobs:
           import os
           from pathlib import Path
           import re
+          import sqlite3
 
           from brier_ml.dataset import _compiled_rows
           from brier_ml.glimmer_data import calibration_partition
 
           root = Path(os.environ["BRIER_DATA"])
           manifest = json.loads((root / "bundle-manifest.json").read_text())
-          required = {"ledger.sqlite", "compiled.jsonl", "risk-calibration.json", "t1.json", "replay-scores.json",
+          required = {"ledger.sqlite", "compiled.jsonl", "scenarios.jsonl", "risk-calibration.json", "t1.json", "replay-scores.json",
                       "report.json", "baseline-policy.yaml", "aloha-baseline-policy.yaml"}
           if manifest.get("schema") != "brier-decision-bundle-v1" or set(manifest.get("files", {})) != required:
               raise SystemExit("Robot CI requires the complete checksummed decision bundle")
@@ -196,6 +197,20 @@ jobs:
                   raise SystemExit(f"Decision bundle checksum mismatch: {name}")
           if manifest.get("data_sha256") != manifest["files"]["compiled.jsonl"]:
               raise SystemExit("Decision bundle does not bind the compiled dataset")
+          if manifest.get("release_hashes", {}).get("scenarios.jsonl") != manifest["files"]["scenarios.jsonl"]:
+              raise SystemExit("Decision bundle must retain the exact frozen scenario source")
+          definitions = [json.loads(line) for line in (root / "scenarios.jsonl").read_text().splitlines()]
+          with sqlite3.connect((root / "ledger.sqlite").resolve().as_uri() + "?mode=ro", uri=True) as connection:
+              stored = {row[0]: row[1:] for row in connection.execute("SELECT scenario_id,env,params_json,baseline_success FROM scenarios")}
+          if len(definitions) != 32 or {row["scenario_id"] for row in definitions} != set(stored):
+              raise SystemExit("Frozen scenario source must cover the exact 32 stored scenarios")
+          for row in definitions:
+              env = {"pusht": "gym_pusht/PushT-v0", "aloha": "gym_aloha/AlohaTransferCube-v0"}.get(row.get("env"))
+              prior = stored[row["scenario_id"]]
+              if (env != prior[0] or row["params"] != json.loads(prior[1]) or row["baseline_success"] != prior[2]
+                      or len(row["seeds"]) != 50 or len(set(row["seeds"])) != 50
+                      or any(type(seed) is not int or seed < 0 for seed in row["seeds"])):
+                  raise SystemExit("Frozen scenario parameters, baseline or seeds differ from the prepared source")
           risk = json.loads((root / "risk-calibration.json").read_text())
           partition = manifest.get("calibration_partition", {})
           fit, held = partition.get("fit_change_ids", []), partition.get("risk_change_ids", [])
@@ -226,7 +241,6 @@ jobs:
           from pathlib import Path
           import subprocess
           from brier_sim.runner import run_episodes
-          from brier_sim.scenarios import scenarios
 
           root = Path(os.environ["BRIER_DATA"])
           inputs = Path(os.environ["RUNNER_TEMP"]) / "brier-ci"
@@ -238,15 +252,19 @@ jobs:
               "--after", str(inputs / "before.yaml"), "--change", card["change_id"]], text=True)
           if not json.loads(evidence)["t0_identical"]:
               raise SystemExit("The stored 50-episode baseline does not match the deployed policy identity")
-          definitions = scenarios(card["env"])
-          catalog = {"changes": [{"change_id": card["change_id"], "env": card["env"], "card": card["card"]}],
-                     "scenarios": definitions}
+          env = {"gym_pusht/PushT-v0": "pusht", "gym_aloha/AlohaTransferCube-v0": "aloha"}[card["env"]]
+          definitions = [json.loads(line) for line in (root / "scenarios.jsonl").read_text().splitlines()
+                         if json.loads(line)["env"] == env]
+          change = {"change_id": card["change_id"], "env": env, "families": card["card"]["families"],
+                    "desc": card["card"]["description"], "seed": int(card["change_id"][1:])}
+          catalog = {"changes": [{"change_id": card["change_id"], "env": card["env"], "card": change}],
+                     "scenarios": [{**scenario, "env": card["env"]} for scenario in definitions]}
           (root / "current-catalog.json").write_text(json.dumps(catalog) + "\n")
           cheap = root / "cheap"
           cheap.mkdir()
           for scenario in definitions:
               path = run_episodes(card["env"], card["policy"]["id"], 3, scenario["seeds"][0],
-                  card["change_id"], scenario["scenario_id"], "cheap", change=card["card"], scenario=scenario,
+                  card["change_id"], scenario["scenario_id"], "cheap", change=change, scenario=scenario,
                   revision=card["policy"]["revision"])
               path.rename(cheap / f"{scenario['scenario_id']}.parquet")
           subprocess.run([binary, "label", "--ledger", str(root / "ledger.sqlite"),
@@ -264,13 +282,15 @@ jobs:
           from pathlib import Path
           import subprocess
           from brier_sim.runner import run_episodes
-          from brier_sim.scenarios import scenarios
 
           root = Path(os.environ["BRIER_DATA"])
           inputs = Path(os.environ["RUNNER_TEMP"]) / "brier-ci"
           card = json.loads((inputs / "card.json").read_text())
           decisions = json.loads((root / "decisions.json").read_text())["decisions"]
-          definitions = {scenario["scenario_id"]: scenario for scenario in scenarios(card["env"])}
+          env = {"gym_pusht/PushT-v0": "pusht", "gym_aloha/AlohaTransferCube-v0": "aloha"}[card["env"]]
+          definitions = {scenario["scenario_id"]: scenario for scenario in
+                         (json.loads(line) for line in (root / "scenarios.jsonl").read_text().splitlines()) if scenario["env"] == env}
+          change = json.loads((root / "current-catalog.json").read_text())["changes"][0]["card"]
           expensive = root / "expensive"
           expensive.mkdir()
           for decision in decisions:
@@ -280,7 +300,7 @@ jobs:
                   raise SystemExit(f"Unsupported requested action: {decision['action']}")
               scenario = definitions[decision["scenario_id"]]
               path = run_episodes(card["env"], card["policy"]["id"], 20, scenario["seeds"][0],
-                  card["change_id"], scenario["scenario_id"], "expensive", change=card["card"], scenario=scenario,
+                  card["change_id"], scenario["scenario_id"], "expensive", change=change, scenario=scenario,
                   revision=card["policy"]["revision"])
               path.rename(expensive / f"{scenario['scenario_id']}.parquet")
           if any(decision["action"] == "expensive" for decision in decisions):
