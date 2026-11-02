@@ -1,10 +1,12 @@
-import { Clock3 } from "lucide-react";
-import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import Link from "next/link";
+import { ArrowUpRight } from "lucide-react";
+import { Card } from "@/components/ui/card";
 
-/** Show an explicit pending state without fabricated measurements. */
+/** Show a purposeful empty state while keeping absent measurements explicit. */
 export function Pending({ title, children }: { title: string; children: React.ReactNode }) {
-  return <Card className="border-dashed shadow-none"><CardHeader>
-    <CardTitle className="flex items-center gap-2 text-base"><Clock3 className="size-4 text-muted-foreground" aria-hidden="true" />{title}</CardTitle>
-    <CardDescription className="max-w-2xl leading-relaxed">{children}</CardDescription>
-  </CardHeader></Card>;
+  return <Card className="empty-panel shadow-none" role="status"><div>
+    <div className="empty-mark" aria-hidden="true"><i /><i /><i /><i /></div>
+    <h2>{title}</h2><p>{children}</p>
+    <Link className="subtle-link mt-5" href="https://github.com/SiddharthManjul/Brier#readme">Read the setup guide<ArrowUpRight className="size-3" aria-hidden="true" /></Link>
+  </div></Card>;
 }
