@@ -1,4 +1,7 @@
 use crate::policy::{calibrate, missed_fraction, LabeledChange, PairScore, Policy};
+use crate::policy::{
+    executed_loss, selected, ExecutedChange, ExecutedPolicy, Guarantee, LAMBDA_HIGH, LAMBDA_LOW,
+};
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -69,6 +72,114 @@ pub struct ReplayReport {
     pub splits: Vec<RandomSplit>,
     pub empirical_splits_within_alpha: usize,
     pub timeline: Timeline,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutedDecision {
+    pub scenario_id: String,
+    pub probability: f64,
+    pub cheap_run: bool,
+    pub policy_selected: bool,
+    pub exploration: bool,
+    pub selected: bool,
+    pub ran: bool,
+    pub observed_regressed: Option<bool>,
+    pub reason: String,
+}
+
+/// Executes fixed adaptive scoring, exploration, and four-job waves on offline truth.
+pub fn execute_change(
+    change: &ExecutedChange,
+    policy: &ExecutedPolicy,
+    seed: u64,
+) -> Result<Vec<ExecutedDecision>> {
+    executed_loss(change, policy.lambda, policy.guarantee)?;
+    let mut pairs: Vec<_> = change.pairs.iter().collect();
+    pairs.sort_by(|a, b| a.scenario_id.cmp(&b.scenario_id));
+    let mut rng = Rng(seed);
+    let mut decisions: Vec<_> = pairs
+        .iter()
+        .map(|pair| {
+            let cheap_run = (LAMBDA_LOW..LAMBDA_HIGH).contains(&pair.noev_probability);
+            let policy_selected = selected(pair, policy);
+            let exploration = !policy_selected && rng.unit() < 0.05;
+            ExecutedDecision {
+                scenario_id: pair.scenario_id.clone(),
+                probability: if cheap_run {
+                    pair.probability
+                } else {
+                    pair.noev_probability
+                },
+                cheap_run,
+                policy_selected,
+                exploration,
+                selected: policy_selected || exploration,
+                ran: false,
+                observed_regressed: None,
+                reason: if exploration {
+                    "exploration"
+                } else if policy_selected {
+                    "policy_above_lambda"
+                } else if pair.noev_probability < LAMBDA_LOW {
+                    "cheap_skipped_confident_low"
+                } else {
+                    "policy_below_lambda"
+                }
+                .into(),
+            }
+        })
+        .collect();
+    let mut order: Vec<_> = (0..decisions.len())
+        .filter(|&i| decisions[i].selected)
+        .collect();
+    order.sort_by(|&a, &b| {
+        decisions[b]
+            .probability
+            .total_cmp(&decisions[a].probability)
+            .then_with(|| decisions[a].scenario_id.cmp(&decisions[b].scenario_id))
+    });
+    let mut stopped = false;
+    for wave in order.chunks(4) {
+        for &i in wave {
+            if stopped {
+                decisions[i].reason = "early_stop_not_needed".into();
+            } else {
+                decisions[i].ran = true;
+                decisions[i].observed_regressed = Some(pairs[i].regressed);
+            }
+        }
+        if policy.guarantee == Guarantee::Change
+            && wave
+                .iter()
+                .any(|&i| decisions[i].observed_regressed == Some(true))
+        {
+            stopped = true;
+        }
+    }
+    Ok(decisions)
+}
+
+/// Returns twenty whole-change 75/25 partitions, independently seeded zero through nineteen.
+pub fn heldout_partitions(ids: &[String]) -> Result<Vec<(Vec<String>, Vec<String>)>> {
+    ensure!(ids.len() >= 2, "at least two held-out changes required");
+    let mut sorted = ids.to_vec();
+    sorted.sort();
+    ensure!(
+        sorted.windows(2).all(|w| w[0] != w[1]),
+        "duplicate held-out change"
+    );
+    let count = (sorted.len() * 3 / 4).clamp(1, sorted.len() - 1);
+    Ok((0..20)
+        .map(|seed| {
+            let mut rng = Rng(seed);
+            let mut shuffled = sorted.clone();
+            for end in (1..shuffled.len()).rev() {
+                let selected = rng.index(end + 1);
+                shuffled.swap(end, selected);
+            }
+            (shuffled[..count].to_vec(), shuffled[count..].to_vec())
+        })
+        .collect())
 }
 
 /// Replays fixed scores on calibration/test changes with twenty seeded splits.
