@@ -409,6 +409,132 @@ fn write_jsonl(path: &Path, rows: &[Value]) {
     .unwrap();
 }
 
+fn write_guide_parquet(path: &Path, rows: &[Value]) {
+    let fields = "env:s policy_repo:s policy_revision:s change_id:s scenario_id:s tier:s episode_idx:i seed:l success:b steps:i max_steps:i reward_sum:f max_reward:f final_reward:f coverage_final:f coverage_max:f block_disp_px:f touched_right:b touched_left:b lifted:b table_contact_steps:i action_flip_rate:f terminal_state_json:s keyframes_uri:s wall_seconds:f lerobot_version:s code_commit:s host:s";
+    let nullable = [
+        "coverage_final",
+        "coverage_max",
+        "block_disp_px",
+        "touched_right",
+        "touched_left",
+        "lifted",
+        "table_contact_steps",
+        "keyframes_uri",
+    ];
+    let columns: Vec<_> = fields
+        .split_whitespace()
+        .map(|field| field.split_once(':').unwrap())
+        .collect();
+    let schema = columns
+        .iter()
+        .map(|(name, kind)| {
+            format!(
+                "{} {} {name}{};",
+                if nullable.contains(name) {
+                    "OPTIONAL"
+                } else {
+                    "REQUIRED"
+                },
+                match *kind {
+                    "s" => "BYTE_ARRAY",
+                    "i" => "INT32",
+                    "l" => "INT64",
+                    "b" => "BOOLEAN",
+                    _ => "DOUBLE",
+                },
+                if *kind == "s" { " (UTF8)" } else { "" }
+            )
+        })
+        .collect::<String>();
+    let schema = Arc::new(parse_message_type(&format!("message episodes {{{schema}}}")).unwrap());
+    let mut writer =
+        SerializedFileWriter::new(File::create(path).unwrap(), schema, Arc::default()).unwrap();
+    let mut group = writer.next_row_group().unwrap();
+    for (name, kind) in columns {
+        let mut column = group.next_column().unwrap().unwrap();
+        let levels: Vec<_> = rows
+            .iter()
+            .map(|row| i16::from(!row[name].is_null()))
+            .collect();
+        let definitions = nullable.contains(&name).then_some(levels.as_slice());
+        let values: Vec<_> = rows
+            .iter()
+            .map(|row| &row[name])
+            .filter(|value| !value.is_null())
+            .collect();
+        match kind {
+            "s" => {
+                column
+                    .typed::<ByteArrayType>()
+                    .write_batch(
+                        &values
+                            .iter()
+                            .map(|value| ByteArray::from(value.as_str().unwrap()))
+                            .collect::<Vec<_>>(),
+                        definitions,
+                        None,
+                    )
+                    .unwrap();
+            }
+            "i" => {
+                column
+                    .typed::<parquet::data_type::Int32Type>()
+                    .write_batch(
+                        &values
+                            .iter()
+                            .map(|value| value.as_i64().unwrap() as i32)
+                            .collect::<Vec<_>>(),
+                        definitions,
+                        None,
+                    )
+                    .unwrap();
+            }
+            "l" => {
+                column
+                    .typed::<Int64Type>()
+                    .write_batch(
+                        &values
+                            .iter()
+                            .map(|value| value.as_i64().unwrap())
+                            .collect::<Vec<_>>(),
+                        definitions,
+                        None,
+                    )
+                    .unwrap();
+            }
+            "b" => {
+                column
+                    .typed::<BoolType>()
+                    .write_batch(
+                        &values
+                            .iter()
+                            .map(|value| value.as_bool().unwrap())
+                            .collect::<Vec<_>>(),
+                        definitions,
+                        None,
+                    )
+                    .unwrap();
+            }
+            _ => {
+                column
+                    .typed::<DoubleType>()
+                    .write_batch(
+                        &values
+                            .iter()
+                            .map(|value| value.as_f64().unwrap())
+                            .collect::<Vec<_>>(),
+                        definitions,
+                        None,
+                    )
+                    .unwrap();
+            }
+        }
+        column.close().unwrap();
+    }
+    group.close().unwrap();
+    writer.close().unwrap();
+}
+
 fn read_jsonl(path: &Path) -> Vec<Value> {
     fs::read_to_string(path)
         .unwrap()
@@ -441,6 +567,188 @@ fn guide_label(f: &Fixture) -> (i64, String, i64, String) {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap()
+}
+
+#[test]
+fn staged_live_import_preserves_measured_guide_baseline_without_a_base_change() {
+    for fault in [None, Some("uuid"), Some("uri")] {
+        let f = guide_fixture("pusht", 40, 12);
+        let mut cards = read_jsonl(&f.directory.join("changes.jsonl"));
+        cards[0]["change_id"] = json!("c004");
+        write_jsonl(&f.directory.join("changes.jsonl"), &cards);
+        let mut definitions = read_jsonl(&f.directory.join("scenarios.jsonl"));
+        definitions[0]["seeds"] = json!((0..50).collect::<Vec<_>>());
+        write_jsonl(&f.directory.join("scenarios.jsonl"), &definitions);
+        let mut rows = read_jsonl(&f.directory.join("episodes.jsonl"));
+        for row in &mut rows {
+            row["seed"] = row["episode_idx"].clone();
+            if row["change_id"] != "base" {
+                row["change_id"] = json!("c004");
+            }
+        }
+        write_jsonl(&f.directory.join("episodes.jsonl"), &rows);
+        assert!(guide_command(&f).status.success());
+        let connection = Connection::open(&f.ledger).unwrap();
+        let baseline: (String, String, i64, i64) = connection
+            .query_row(
+                "SELECT run_id,uri,episodes,successes FROM runs WHERE tier='baseline'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        if fault.is_some() {
+            connection
+                .execute_batch("DROP TRIGGER runs_no_UPDATE")
+                .unwrap();
+        }
+        match fault {
+            Some("uuid") => {
+                connection
+                    .execute(
+                        "UPDATE runs SET run_id=?1 WHERE tier='baseline'",
+                        [Uuid::new_v4().to_string()],
+                    )
+                    .unwrap();
+            }
+            Some("uri") => {
+                connection
+                    .execute(
+                        "UPDATE runs SET uri='unverified.parquet' WHERE tier='baseline'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            _ => {}
+        }
+        fs::write(
+            f.directory.join("catalog.json"),
+            json!({"changes":[{"change_id":"c002",
+            "env":"gym_pusht/PushT-v0","card":{"description":"live gain change",
+            "families":[{"family":"action_scale","params":{"scale":0.9}}]}}],
+            "scenarios":[{"scenario_id":"pusht-s01","env":"gym_pusht/PushT-v0",
+            "params":{"pose_bin":1,"lighting":"normal","camera_jitter":false},
+            "seeds":(0..50).collect::<Vec<_>>()}]})
+            .to_string(),
+        )
+        .unwrap();
+        let cheap = f.directory.join("cheap-stage");
+        let expensive = f.directory.join("expensive-stage");
+        fs::create_dir(&cheap).unwrap();
+        fs::create_dir(&expensive).unwrap();
+        write_episodes(&cheap.join("cheap.parquet"), "cheap", 3, 2, true);
+        write_episodes(
+            &expensive.join("expensive.parquet"),
+            "expensive",
+            20,
+            12,
+            true,
+        );
+        let result = command_at(&f, &cheap);
+        if fault.is_some() {
+            assert!(!result.status.success());
+            assert!(String::from_utf8_lossy(&result.stderr).contains("Guide 1 baseline identity"));
+            assert_eq!(counts(&f), (3, 1));
+            continue;
+        }
+        assert!(result.status.success(), "{:?}", result);
+        assert_eq!(counts(&f), (4, 1));
+        let result = command_at(&f, &expensive);
+        assert!(result.status.success(), "{:?}", result);
+        assert_eq!(counts(&f), (5, 2));
+        let after = connection
+            .query_row(
+                "SELECT run_id,uri,episodes,successes FROM runs WHERE tier='baseline'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(baseline, after);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM changes WHERE change_id='base'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert!(!command_at(&f, &expensive).status.success());
+        assert_eq!(counts(&f), (5, 2));
+    }
+}
+
+#[test]
+fn staged_guide_parquet_uses_authoritative_guide_labels_and_preserves_frozen_rows() {
+    for wins in [4, 12, 13, 20] {
+        let f = guide_fixture("pusht", 40, wins);
+        let original = read_jsonl(&f.directory.join("episodes.jsonl"));
+        let mut old_rows = original.clone();
+        for row in &mut old_rows {
+            if row["change_id"] != "base" {
+                row["change_id"] = json!("c004");
+            }
+        }
+        let mut old_cards = read_jsonl(&f.directory.join("changes.jsonl"));
+        let live_card = old_cards[0].clone();
+        old_cards[0]["change_id"] = json!("c004");
+        write_jsonl(&f.directory.join("changes.jsonl"), &old_cards);
+        write_jsonl(&f.directory.join("episodes.jsonl"), &old_rows);
+        assert!(guide_command(&f).status.success());
+        let connection = Connection::open(&f.ledger).unwrap();
+        let expected: (i64, String, i64, String) = connection.query_row(
+            "SELECT regressed,failure_mode,success_bucket,cause_family FROM labels WHERE change_id='c004'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        let mut definition = read_jsonl(&f.directory.join("scenarios.jsonl"))[0].clone();
+        definition["env"] = json!("gym_pusht/PushT-v0");
+        fs::write(
+            f.directory.join("catalog.json"),
+            json!({"changes":[{"change_id":"c002",
+            "env":"gym_pusht/PushT-v0","card":live_card}],"scenarios":[definition]})
+            .to_string(),
+        )
+        .unwrap();
+        for tier in ["cheap", "expensive"] {
+            let directory = f.directory.join(tier);
+            fs::create_dir(&directory).unwrap();
+            let mut rows: Vec<_> = original
+                .iter()
+                .filter(|row| row["tier"] == tier)
+                .cloned()
+                .collect();
+            if tier == "expensive" {
+                rows.pop();
+                write_guide_parquet(&directory.join("episodes.parquet"), &rows);
+                assert!(!command_at(&f, &directory).status.success());
+                assert_eq!(counts(&f), (4, 1));
+                rows = original
+                    .iter()
+                    .filter(|row| row["tier"] == tier)
+                    .cloned()
+                    .collect();
+            }
+            write_guide_parquet(&directory.join("episodes.parquet"), &rows);
+            let result = command_at(&f, &directory);
+            assert!(result.status.success(), "{:?}", result);
+        }
+        assert_eq!(counts(&f), (5, 2));
+        let actual = connection.query_row(
+            "SELECT regressed,failure_mode,success_bucket,cause_family FROM labels WHERE change_id='c002'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(expected, actual);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM changes WHERE change_id='base'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
 }
 
 #[test]
