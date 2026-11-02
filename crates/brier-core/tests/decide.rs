@@ -385,8 +385,8 @@ fn uncertain_t2_reads_actual_cheap_evidence_and_t3_only_adds_evaluations() {
     assert!(python.status.success());
     let python = String::from_utf8(python.stdout).unwrap();
     for (recommend, risk, reason) in [
-        ("run_expensive", 0.8, "t3_addition"),
-        ("no_change", 0.4, "threshold"),
+        ("run_expensive", 0.55, "t3_added"),
+        ("no_change", 0.55, "t3_no_change"),
     ] {
         let fixture = Fixture::new(0.5, risk);
         let raw = fixture.directory.join("cheap.parquet");
@@ -452,10 +452,25 @@ json.dump({'model':'muse-spark-1.3-contributor','recommend':(root/'recommend').r
         );
         let report: Value = serde_json::from_slice(&result.stdout).unwrap();
         let decision = &report["decisions"][0];
+        if decision["reason"] == "exploration" {
+            assert_eq!(decision["tier_used"], "T2");
+            assert!(!fixture.directory.join("t3-request.json").exists());
+            continue;
+        }
         assert_eq!(decision["tier_used"], "T2+T3");
-        assert_eq!(decision["action"], "expensive");
+        assert_eq!(
+            decision["action"],
+            if recommend == "no_change" {
+                "skip"
+            } else {
+                "expensive"
+            }
+        );
         assert_eq!(decision["reason"], reason);
-        assert_eq!(decision["propensity"], 1.0);
+        assert_eq!(
+            decision["propensity"],
+            if recommend == "no_change" { 0.05 } else { 1.0 }
+        );
         assert_eq!(decision["lambda"], risk);
         assert_eq!(decision["probabilities"]["regressed"]["yes"], 0.5);
         assert_eq!(
@@ -515,7 +530,7 @@ fn live_t1_decisions_are_logged_once_without_computing_labels() {
     assert_eq!(decision.tier_used, "T1");
     assert_eq!(decision.action, "expensive");
     assert_eq!(decision.propensity, 1.0);
-    assert_eq!(decision.reason, "threshold");
+    assert_eq!(decision.reason, "policy_above_lambda");
     assert_eq!(decision.probabilities["regressed"]["yes"], 0.95);
     assert!(uuid::Uuid::parse_str(&decision.decision_id).is_ok());
     assert_eq!(fixture.decision_count(), 1);
@@ -906,4 +921,107 @@ fn decide_cli_emits_the_logged_report() {
     assert_eq!(report["change_id"], "c999");
     assert_eq!(report["policy"]["calibration_changes"], 19);
     assert_eq!(fixture.decision_count(), 1);
+}
+
+#[test]
+fn adaptive_decide_returns_a_bound_cheap_plan_then_reuses_noev_scores() {
+    use brier_core::{decide::decide_guarantee, policy::Guarantee};
+    let _guard = MODAL_ENV.lock().unwrap();
+    let fixture = Fixture::new(0.5, 0.5);
+    assert!(decide_guarantee(
+        &fixture.ledger,
+        &fixture.compiled,
+        &fixture.calibration,
+        "../escape",
+        0.05,
+        Guarantee::Change
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("c001"));
+    let mut risk = fixture.artifact();
+    risk["format_version"] = json!(2);
+    risk["changes"] = json!([{"change_id":"c009","pairs":[{"scenario_id":"pusht-s01","probability":0.5,"regressed":true}]}, {"change_id":"c010","pairs":[{"scenario_id":"pusht-s01","probability":0.5,"regressed":false}]}]);
+    risk["executed_changes"] = risk["changes"].clone();
+    for change in risk["executed_changes"].as_array_mut().unwrap() {
+        change["pairs"][0]["noev_probability"] = json!(0.5);
+    }
+    fixture.save(&risk);
+    let connection = Connection::open(&fixture.ledger).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER runs_no_DELETE; DELETE FROM runs WHERE change_id='c999';")
+        .unwrap();
+    let previous = std::env::var_os("MODAL_DECIDE_URL");
+    let (url, handle) = server(risk["model_version"].as_str().unwrap().into(), false, 0.5);
+    std::env::set_var("MODAL_DECIDE_URL", url);
+    let plan = decide_guarantee(
+        &fixture.ledger,
+        &fixture.compiled,
+        &fixture.calibration,
+        "c999",
+        0.05,
+        Guarantee::Change,
+    )
+    .unwrap();
+    assert!(handle.join().unwrap()["questions"][0]["id"]
+        .as_str()
+        .unwrap()
+        .ends_with("no_cheap"));
+    assert_eq!(plan.cheap_required, vec!["pusht-s01"]);
+    assert!(plan.decisions.is_empty());
+    assert_eq!(fixture.decision_count(), 0);
+    let cache = fixture.directory.join("c999-noev-plan.json");
+    let original = fs::read(&cache).unwrap();
+    let mut corrupted: Value = serde_json::from_slice(&original).unwrap();
+    corrupted["scores"]["pusht-s01"]["regressed"]["yes"] = json!(0.6);
+    fs::write(&cache, serde_json::to_vec(&corrupted).unwrap()).unwrap();
+    assert!(decide_guarantee(
+        &fixture.ledger,
+        &fixture.compiled,
+        &fixture.calibration,
+        "c999",
+        0.05,
+        Guarantee::Change
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("cache binding"));
+    fs::write(&cache, &original).unwrap();
+    connection
+        .execute(
+            "INSERT INTO runs VALUES(?1,'c999','pusht-s01','cheap',3,2,0.41,'raw',3.0)",
+            [uuid::Uuid::new_v4().to_string()],
+        )
+        .unwrap();
+    let (url, handle) = server(risk["model_version"].as_str().unwrap().into(), false, 0.5);
+    std::env::set_var("MODAL_DECIDE_URL", url);
+    let final_report = decide_guarantee(
+        &fixture.ledger,
+        &fixture.compiled,
+        &fixture.calibration,
+        "c999",
+        0.05,
+        Guarantee::Scenario,
+    )
+    .unwrap();
+    assert!(handle.join().unwrap()["questions"][0]["id"]
+        .as_str()
+        .unwrap()
+        .ends_with("/cheap"));
+    assert!(final_report.cheap_required.is_empty());
+    assert_eq!(final_report.decisions.len(), 1);
+    assert_eq!(
+        final_report.decisions[0].probabilities["selection_basis"],
+        "run_all_uncertifiable"
+    );
+    assert_eq!(
+        final_report.decisions[0].probabilities["policy"]["guarantee"],
+        "scenario"
+    );
+    assert_eq!(fixture.decision_count(), 1);
+    assert_eq!(fs::read(cache).unwrap(), original);
+    match previous {
+        Some(value) => std::env::set_var("MODAL_DECIDE_URL", value),
+        None => std::env::remove_var("MODAL_DECIDE_URL"),
+    }
 }
