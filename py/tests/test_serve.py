@@ -234,7 +234,8 @@ def _lora_checkpoint(directory: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (adapter / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "r": 16, "lora_alpha": 32}))
     (adapter / "adapter_model.safetensors").write_bytes(b"test-adapter-weights")
     (adapter / "brier-model.json").write_text(json.dumps({
-        "config": {"model_id": "configured/model", "revision": "a" * 40}, "step": 50,
+        "config": {"model_id": "configured/model", "revision": "a" * 40,
+                   "dataset_digest": "b" * 64, "smoke": False, "recipe": {"epochs": 1}}, "step": 50,
     }))
     monkeypatch.setitem(sys.modules, "vllm.lora.request", SimpleNamespace(LoRARequest=lambda *args: args))
     return adapter
@@ -250,6 +251,39 @@ def test_adapter_version_changes_for_weights_and_config(tmp_path: Path, monkeypa
     (adapter / "adapter_model.safetensors").write_bytes(b"different-test-weights")
     _, changed_weights = serving._adapter(tmp_path, "configured/model", "a" * 40)
     assert len({original, changed_config, changed_weights}) == 3
+
+
+@pytest.mark.parametrize("broken", [None, "smoke", "digest", "missing_meta", "steps", "revision", "holdout"])
+def test_guide_adapter_requires_completed_epoch_and_independent_holdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, broken: str | None,
+) -> None:
+    adapter = _lora_checkpoint(tmp_path, monkeypatch)
+    manifest = json.loads((adapter / "brier-model.json").read_text())
+    manifest["config"].pop("smoke")
+    manifest["config"]["recipe"] = {"epochs": 1, "max_steps": None, "effective_batch": 32}
+    manifest["step"] = 249
+    meta = {"base_repo": "configured/model", "revision": "a" * 40, "data_sha256": "b" * 64,
+            "config": dict(manifest["config"]["recipe"]), "steps": 249, "epochs": 1,
+            "calibration_partition": {"fit_change_ids": ["c021"],
+                                      "risk_change_ids": [f"c{index:03}" for index in range(1, 20)]}}
+    if broken == "smoke":
+        manifest["config"]["recipe"]["max_steps"] = 50
+    elif broken == "digest":
+        manifest["config"]["dataset_digest"] = "not-a-digest"
+    elif broken == "steps":
+        meta["steps"] = 50
+    elif broken == "revision":
+        meta["revision"] = "c" * 40
+    elif broken == "holdout":
+        meta["calibration_partition"]["risk_change_ids"][0] = "c021"
+    (adapter / "brier-model.json").write_text(json.dumps(manifest))
+    if broken != "missing_meta":
+        (tmp_path / "run_meta.json").write_text(json.dumps(meta))
+    if broken:
+        with pytest.raises(ValueError, match="LoRA checkpoint"):
+            serving._adapter(tmp_path, "configured/model", "a" * 40)
+    else:
+        assert serving._adapter(tmp_path, "configured/model", "a" * 40)[1].startswith("configured/model@")
 
 
 @pytest.mark.parametrize("broken", ["adapter_config.json", "adapter_model.safetensors", "brier-model.json",
