@@ -397,8 +397,8 @@ fn uncertain_t2_reads_actual_cheap_evidence_and_t3_only_adds_evaluations() {
             .unwrap();
         connection
             .execute(
-                "UPDATE runs SET uri=?1 WHERE run_id='live-cheap'",
-                [raw.to_str().unwrap()],
+                "UPDATE runs SET uri=?1,run_id=?2 WHERE run_id='live-cheap'",
+                [raw.to_str().unwrap(), &uuid::Uuid::new_v4().to_string()],
             )
             .unwrap();
         let bin = fixture.directory.join("bin");
