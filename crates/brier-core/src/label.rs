@@ -8,6 +8,9 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use brier_core::ledger;
+use brier_core::policy::{
+    selected, ExecutedPair, ExecutedPolicy, Guarantee, LAMBDA_HIGH, LAMBDA_LOW,
+};
 use parquet::{
     file::reader::{FileReader, SerializedFileReader},
     record::{Field, Row, RowAccessor},
@@ -105,6 +108,171 @@ fn family(card: &Value) -> Result<String> {
         "benign must be the only family"
     );
     Ok(names.into_iter().collect::<Vec<_>>().join("+"))
+}
+
+fn guide3_direct_selected(connection: &Connection, change: &str, scenario: &str) -> Result<()> {
+    ensure!(
+        connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM changes WHERE change_id=?1)",
+            [change],
+            |row| row.get::<_, bool>(0)
+        )?,
+        "Guide 3 decision requires an existing live change"
+    );
+    let mut query = connection.prepare("SELECT json_object('decision_id',decision_id,'change_id',change_id,'scenario_id',scenario_id,'tier_used',tier_used,'model_version',model_version,'probabilities',json(probs_json),'lambda',lambda,'action',action,'propensity',propensity,'reason',reason) FROM decisions WHERE change_id=?1 AND scenario_id=?2")?;
+    let rows = query
+        .query_map([change, scenario], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(
+        rows.len() == 1,
+        "missing cheap run requires exactly one logged Guide 3 decision for {change}/{scenario}"
+    );
+    let decision: brier_core::decide::Decision = serde_json::from_str(&rows[0])?;
+    ensure!(
+        Uuid::parse_str(&decision.decision_id).is_ok_and(|id| id.get_version_num() == 4
+            && id.get_variant() == uuid::Variant::RFC4122
+            && id.to_string() == decision.decision_id)
+            && decision.action == "expensive"
+            && decision.tier_used == "T2-noev",
+        "missing cheap run requires a selected Guide 3 no-evidence decision"
+    );
+    let hex = |value: &str, len| {
+        value.len() == len
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    let (base, adapter) = decision
+        .model_version
+        .split_once("+lora@")
+        .context("Guide 3 decision requires a pinned fine-tuned model")?;
+    let (name, revision) = base
+        .rsplit_once('@')
+        .context("Guide 3 decision requires a model revision")?;
+    let scores = &decision.probabilities;
+    let calibration = &scores["calibration"];
+    ensure!(
+        !name.is_empty()
+            && !name.contains('@')
+            && !name.contains(char::is_whitespace)
+            && hex(revision, 40)
+            && hex(adapter, 64)
+            && calibration["model_version"] == decision.model_version
+            && calibration.as_object().is_some_and(|v| v.len() == 3)
+            && calibration["t1_model_version"]
+                .as_str()
+                .and_then(|v| v.strip_prefix("t1@"))
+                .is_some_and(|v| hex(v, 64)),
+        "Guide 3 model/calibration identity mismatch"
+    );
+    ensure!(
+        scores.as_object().is_some_and(|v| v.len() == 7),
+        "invalid Guide 3 no-evidence metadata"
+    );
+    for (kind, options) in [
+        ("regressed", vec!["yes", "no"]),
+        ("failure_mode", MODES.to_vec()),
+        ("success_bucket", vec!["1", "2", "3", "4", "5"]),
+    ] {
+        let map = scores[kind]
+            .as_object()
+            .context("missing Guide 3 semantic probabilities")?;
+        ensure!(
+            map.len() == options.len()
+                && options.iter().all(|key| map.contains_key(*key))
+                && map.values().all(|v| v
+                    .as_f64()
+                    .is_some_and(|p| p.is_finite() && (0.0..=1.0).contains(&p)))
+                && (map.values().map(|v| v.as_f64().unwrap()).sum::<f64>() - 1.0).abs() <= 1.1e-7,
+            "invalid Guide 3 semantic probability distribution"
+        );
+    }
+    let policy: ExecutedPolicy = serde_json::from_value(scores["policy"].clone())
+        .context("missing executed Guide 3 policy")?;
+    let minimum = 1.0 / (policy.calibration_changes as f64 + 1.0);
+    ensure!(
+        scores["policy"].as_object().is_some_and(|v| v.len() == 8)
+            && policy.alpha.is_finite()
+            && (0.0..=1.0).contains(&policy.alpha)
+            && policy.lambda.is_finite()
+            && (0.0..=1.0).contains(&policy.lambda)
+            && decision.lambda == policy.lambda
+            && policy.calibration_changes > 0
+            && policy.risk_bound.is_finite()
+            && (minimum..=1.0).contains(&policy.risk_bound)
+            && policy.run_all != policy.certified
+            && if policy.certified {
+                policy.risk_bound <= policy.alpha
+            } else {
+                policy.lambda == 0.0 && policy.risk_bound > policy.alpha
+            },
+        "invalid Guide 3 policy certificate or fallback"
+    );
+    ensure!(
+        policy.guarantee_metric
+            == match policy.guarantee {
+                Guarantee::Change => "unconditional_change_miss",
+                Guarantee::Scenario => "mean_scenario_miss",
+            },
+        "Guide 3 guarantee metric mismatch"
+    );
+    let risk = calibration["risk_change_ids"]
+        .as_array()
+        .context("missing Guide 3 risk pool")?;
+    let ids: BTreeSet<_> = risk
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .filter(|id| {
+                    *id != change
+                        && id.strip_prefix('c').is_some_and(|n| {
+                            n.len() >= 3
+                                && n.bytes().all(|b| b.is_ascii_digit())
+                                && n.bytes().any(|b| b != b'0')
+                        })
+                })
+                .context("invalid Guide 3 risk change ID")
+        })
+        .collect::<Result<_>>()?;
+    ensure!(
+        risk.len() == policy.calibration_changes && ids.len() == risk.len(),
+        "Guide 3 risk pool size mismatch"
+    );
+    let noev = scores["noev_probability"]
+        .as_f64()
+        .filter(|p| p.is_finite() && (0.0..=1.0).contains(p))
+        .context("invalid no-evidence regression probability")?;
+    let probability = scores["regressed"]["yes"].as_f64().unwrap();
+    ensure!(
+        probability == noev && !(LAMBDA_LOW..LAMBDA_HIGH).contains(&noev),
+        "uncertain or mismatched no-evidence score requires cheap episodes"
+    );
+    let chosen = selected(
+        &ExecutedPair {
+            scenario_id: scenario.into(),
+            probability,
+            noev_probability: noev,
+            regressed: false,
+        },
+        &policy,
+    );
+    let basis = if policy.run_all {
+        "run_all_uncertifiable"
+    } else if noev >= LAMBDA_HIGH {
+        "confident_high"
+    } else {
+        "confident_low"
+    };
+    ensure!(
+        scores["selection_basis"] == basis
+            && if chosen {
+                decision.reason == "policy_above_lambda" && decision.propensity == 1.0
+            } else {
+                noev < LAMBDA_LOW && decision.reason == "exploration" && decision.propensity == 0.05
+            },
+        "Guide 3 action, propensity or selection basis mismatch"
+    );
+    Ok(())
 }
 
 fn failed_mode(terminal: &str, env: &str) -> Result<usize> {
@@ -476,15 +644,22 @@ pub fn label(ledger_path: &Path, episodes: &Path, catalog_path: &Path) -> Result
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            ensure!(
-                existing.len() == 1
-                    && existing[0].0 == 3
-                    && (0..=3).contains(&existing[0].1)
-                    && existing[0].2.is_finite()
-                    && existing[0].3.is_finite()
-                    && existing[0].3 >= 0.0,
-                "missing or invalid three-episode cheap run for {change}/{scenario}"
-            );
+            if existing.is_empty()
+                && runs[&(change.to_string(), scenario.to_string(), "expensive".into())].guide
+                    == Some(true)
+            {
+                guide3_direct_selected(&transaction, change, scenario)?;
+            } else {
+                ensure!(
+                    existing.len() == 1
+                        && existing[0].0 == 3
+                        && (0..=3).contains(&existing[0].1)
+                        && existing[0].2.is_finite()
+                        && existing[0].3.is_finite()
+                        && existing[0].3 >= 0.0,
+                    "missing or invalid three-episode cheap run for {change}/{scenario}"
+                );
+            }
         }
     }
     let created = SystemTime::now()
