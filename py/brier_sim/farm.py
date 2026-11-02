@@ -23,7 +23,7 @@ import pyarrow.parquet as pq
 import torch
 
 from brier_sim import envs, storage
-from brier_sim.changes import _grid
+from brier_sim.changes import _grid, extend_changes
 from brier_sim.runner import _SCHEMA, _guide_episode, run_episodes, run_key
 from brier_sim.scenarios import build_scenarios, scenarios
 
@@ -420,10 +420,76 @@ def _read(uri: str) -> bytes:
     return location.read_bytes() if isinstance(location, Path) else storage._blob(location).download_as_bytes(retry=None)
 
 
+def _extension_cards(root: str, env: str, sizing: dict, extension: dict) -> list[dict]:
+    fields = {"schema", "seed", "source_root", "source_sha256", "changes_sha256", "appended_change_ids", "baseline_sha256"}
+    if (not isinstance(extension, dict) or set(extension) != fields
+            or extension.get("schema") != "brier-heldout-extension-v1"
+            or type(extension.get("seed")) is not int or extension["seed"] != 2027
+            or not isinstance(extension.get("source_root"), str)):
+        raise ValueError("extension manifest requires exact held-out provenance and seed 2027")
+    source = extension["source_root"].rstrip("/")
+    if storage._location(f"{source}/manifests/sizing.json") == storage._location(f"{root}/manifests/sizing.json"):
+        raise ValueError("extension root must differ from its immutable source")
+    names = {"sizing.json", *(f"{kind}_{e}.{suffix}" for e in ("pusht", "aloha")
+                              for kind, suffix in (("changes", "jsonl"), ("scenarios", "json"), ("magnitudes", "json")))}
+    if (not isinstance(extension["source_sha256"], dict) or set(extension["source_sha256"]) != names
+            or any(not isinstance(extension[key], dict) or set(extension[key]) != {"pusht", "aloha"}
+                   for key in ("changes_sha256", "appended_change_ids"))):
+        raise ValueError("extension must bind both original environments and every frozen manifest")
+    original, current = {}, {}
+    for name in sorted(names):
+        original[name] = _read(f"{source}/manifests/{name}")
+        current[name] = _read(f"{root}/manifests/{name}")
+        if hashlib.sha256(original[name]).hexdigest() != extension["source_sha256"][name]:
+            raise ValueError(f"extension source manifest checksum mismatch: {name}")
+        if not name.startswith("changes_") and current[name] != original[name]:
+            raise ValueError(f"extension changed a frozen manifest: {name}")
+    counts = [len(extension["appended_change_ids"][e]) if isinstance(extension["appended_change_ids"][e], list)
+              else 0 for e in ("pusht", "aloha")]
+    if counts[0] not in (20, 40) or counts[0] != counts[1]:
+        raise ValueError("extension requires the same 20 or 40 held-out changes per environment")
+    planned = {}
+    for e, first in (("pusht", 161), ("aloha", 161 + counts[0])):
+        selected, name = sizing["environments"][e], f"changes_{e}.jsonl"
+        if (type(selected.get("changes")) is not int or not 40 <= selected["changes"] <= 80
+                or selected["changes"] % 4 or selected.get("scenarios") not in (12, 16)
+                or type(selected.get("scenarios")) is not int):
+            raise ValueError("extension requires unchanged supported frozen sizing")
+        old = [json.loads(line) for line in original[name].decode().splitlines() if line.strip()]
+        start = 1 if e == "pusht" else 81
+        if (len(old) != selected["changes"] or any(not isinstance(c, dict) or c.get("env") != e for c in old)
+                or {c.get("change_id") for c in old} != {f"c{i:03}" for i in range(start, start + len(old))}
+                or not original[name].endswith(b"\n") or not current[name].startswith(original[name])):
+            raise ValueError("extension must preserve the complete original change-manifest byte prefix")
+        if hashlib.sha256(current[name]).hexdigest() != extension["changes_sha256"][e]:
+            raise ValueError("extension appended change manifest checksum mismatch")
+        appended = [json.loads(line) for line in current[name][len(original[name]):].decode().splitlines() if line.strip()]
+        expected = extend_changes(e, counts[0], extension["seed"], json.loads(original[f"magnitudes_{e}.json"]), first)
+        if (appended != expected or extension["appended_change_ids"][e] != [c["change_id"] for c in expected]):
+            raise ValueError("extension cards must match the seeded pilot-grid distribution and global new IDs")
+        planned[e] = appended
+    baseline_keys = {f"episodes/env={e}/tier=baseline/change=base/{e}-s{i:02}.parquet"
+                     for e in ("pusht", "aloha") for i in range(1, 17)}
+    if not isinstance(extension["baseline_sha256"], dict) or set(extension["baseline_sha256"]) != baseline_keys:
+        raise ValueError("extension must bind all 32 preserved baseline Parquets")
+    for key in sorted(baseline_keys):
+        before, copied = _read(f"{source}/{key}"), _read(f"{root}/{key}")
+        if hashlib.sha256(before).hexdigest() != extension["baseline_sha256"][key] or copied != before:
+            raise ValueError(f"extension baseline checksum mismatch: {key}")
+    return planned[env]
+
+
 def _guide_plan(env: str, phase: str) -> list[list[tuple]]:
     if env not in ("pusht", "aloha") or phase not in ("baselines", "pairs", "pilot"):
         raise ValueError("run requires a supported env and phase")
     root = _timing_root()
+    extension_uri = f"{root}/manifests/extension.json"
+    extension_present = storage.exists(extension_uri)
+    extension = json.loads(_read(extension_uri)) if extension_present else None
+    if extension_present and not isinstance(extension, dict):
+        raise ValueError("extension manifest must be a provenance object")
+    if extension_present and phase != "pairs":
+        raise ValueError("held-out extension schedules new pairs only; baselines and pilot are frozen")
     definitions = json.loads(_read(f"{root}/manifests/scenarios_{env}.json"))
     if not isinstance(definitions, list) or any(not isinstance(item, dict) or not isinstance(item.get("scenario_id"), str) for item in definitions):
         raise ValueError("scenario manifest must contain the frozen 16 scenarios")
@@ -454,6 +520,10 @@ def _guide_plan(env: str, phase: str) -> list[list[tuple]]:
             or type(selected.get("changes")) is not int or not 40 <= selected["changes"] <= 80 or selected["changes"] % 4
             or type(selected.get("scenarios")) is not int or selected["scenarios"] not in (12, 16)):
         raise ValueError("sizing requires current pins, a supported change count, and 12 or 16 scenarios")
+    if extension is not None:
+        cards = _extension_cards(root, env, sizing, extension)
+        return [[(card, scenario, tier) for scenario in definitions[offset:offset + 4] for tier in ("cheap", "expensive")]
+                for card in cards for offset in range(0, selected["scenarios"], 4)]
     cards = [json.loads(line) for line in _read(f"{root}/manifests/changes_{env}.jsonl").decode().splitlines() if line.strip()]
     expected = {f"c{index:03}" for index in range(1 if env == "pusht" else 81, (1 if env == "pusht" else 81) + selected["changes"])}
     if (len(cards) != selected["changes"] or any(not isinstance(card, dict) or card.get("env") != env
