@@ -430,6 +430,25 @@ pub(crate) fn snapshot(compiled: &Path) -> Result<Snapshot> {
 
 /// Compiles an unlabelled change using cheap evidence and a frozen training snapshot.
 pub fn compile_live(ledger: &Path, change_id: &str, compiled: &Path) -> Result<Vec<CompiledPair>> {
+    compile_live_inner(ledger, change_id, compiled, None)
+}
+
+/// Compiles all no-evidence pairs or just the pairs with complete cheap evidence.
+pub fn compile_live_variant(
+    ledger: &Path,
+    change_id: &str,
+    compiled: &Path,
+    evidence: bool,
+) -> Result<Vec<CompiledPair>> {
+    compile_live_inner(ledger, change_id, compiled, Some(evidence))
+}
+
+fn compile_live_inner(
+    ledger: &Path,
+    change_id: &str,
+    compiled: &Path,
+    evidence: Option<bool>,
+) -> Result<Vec<CompiledPair>> {
     let frozen = snapshot(compiled)?;
     let connection = Connection::open_with_flags(ledger, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let (env, card): (String, String) = connection
@@ -454,7 +473,7 @@ pub fn compile_live(ledger: &Path, change_id: &str, compiled: &Path) -> Result<V
     let mut output = Vec::new();
     for (scenario_id, params, baseline) in scenarios {
         let mut query = connection.prepare("SELECT episodes,successes,mean_reward FROM runs WHERE change_id=?1 AND scenario_id=?2 AND tier='cheap'")?;
-        let runs = query
+        let mut runs = query
             .query_map([change_id, &scenario_id], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -463,6 +482,11 @@ pub fn compile_live(ledger: &Path, change_id: &str, compiled: &Path) -> Result<V
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        if evidence == Some(false) {
+            runs = vec![(3, 0, 0.0)];
+        } else if evidence == Some(true) && runs.is_empty() {
+            continue;
+        }
         ensure!(
             runs.len() == 1 && runs[0].0 == 3,
             "each live scenario requires exactly one three-episode cheap run"
@@ -523,8 +547,18 @@ pub fn compile_live(ledger: &Path, change_id: &str, compiled: &Path) -> Result<V
             .last_mut()
             .context("missing numeric history feature")? =
             state.similar as f64 / count.min(5) as f64;
-        let questions = render(&state)?.into_iter().filter(|row| row["variant"] == "ev")
-            .map(|row| json!({"id":format!("{}/{}/{}/cheap",state.change,state.scenario,row["question"].as_str().unwrap()),
+        let variant = if evidence == Some(false) {
+            "noev"
+        } else {
+            "ev"
+        };
+        let suffix = if evidence == Some(false) {
+            "no_cheap"
+        } else {
+            "cheap"
+        };
+        let questions = render(&state)?.into_iter().filter(|row| row["variant"] == variant)
+            .map(|row| json!({"id":format!("{}/{}/{}/{suffix}",state.change,state.scenario,row["question"].as_str().unwrap()),
                 "prompt":row["prompt"], "options":row["options"].as_array().unwrap().iter().enumerate()
                     .map(|(i, value)| (((b'A'+i as u8) as char).to_string(), semantic(value.as_str().unwrap(),false))).collect::<BTreeMap<_,_>>()})).collect();
         output.push(CompiledPair {
@@ -653,6 +687,19 @@ fn history(card: &Value, neighbors: &[(String, usize, Value)]) -> Result<(f64, u
 
 /// Emits deterministic states with change-disjoint splits and exclusively training history.
 pub fn compile(ledger: &Path, out: &Path) -> Result<()> {
+    compile_heldout(ledger, out, None)
+}
+
+/// Compiles an append-only held-out extension while preserving the original splits.
+pub fn compile_heldout(ledger: &Path, out: &Path, heldout_from: Option<&str>) -> Result<()> {
+    let first = heldout_from
+        .map(|id| {
+            id.strip_prefix('c')
+                .and_then(|n| n.parse::<u64>().ok())
+                .filter(|n| *n > 160)
+                .context("heldout-from must name a new production ID after c160")
+        })
+        .transpose()?;
     let connection = Connection::open_with_flags(ledger, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let mut query = connection.prepare(STATES)?;
     let rows = query.query_map([], |row| row.get::<_, String>(0))?;
@@ -666,6 +713,16 @@ pub fn compile(ledger: &Path, out: &Path) -> Result<()> {
     );
     for state in &mut states {
         state.split = split(&state.change, &state.card)?;
+        if first.is_some_and(|first| {
+            state
+                .change
+                .strip_prefix('c')
+                .and_then(|n| n.parse::<u64>().ok())
+                .is_some_and(|n| n >= first)
+        }) && state.split != "ood"
+        {
+            state.split = "calibration".into();
+        }
     }
     for index in 0..states.len() {
         let state = &states[index];
