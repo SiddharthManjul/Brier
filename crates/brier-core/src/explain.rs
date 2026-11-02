@@ -5,7 +5,7 @@ use parquet::{
     record::{Field, RowAccessor},
 };
 use rusqlite::{params, Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -42,11 +42,15 @@ pub struct ExplainReport {
     pub episodes: Vec<Value>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Episode {
     seed: i64,
     telemetry: Value,
     frames: Value,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Group {
     env: String,
     scenario: Value,
@@ -105,6 +109,21 @@ fn png(root: &Path, value: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn image(root: &Path, value: &str) -> Result<PathBuf> {
+    let path = artifact(root, value)?;
+    ensure!(
+        Path::new(value).is_absolute() && path.is_file(),
+        "frame must be an absolute local image"
+    );
+    let mut signature = [0; 8];
+    File::open(&path)?.read_exact(&mut signature)?;
+    ensure!(
+        &signature == b"\x89PNG\r\n\x1a\n" || signature[..3] == [0xff, 0xd8, 0xff],
+        "frame must contain actual PNG or JPEG data"
+    );
+    Ok(path)
+}
+
 fn frames(root: &Path, uri: &str, count: usize) -> Result<Value> {
     let directory = artifact(root, uri)?;
     ensure!(
@@ -151,6 +170,76 @@ fn group(connection: &Connection, root: &Path, run: &str, tier: &str) -> Result<
     );
     compile::sam_prompts(&env)?;
     let scenario: Value = serde_json::from_str(&scenario)?;
+    let version = Uuid::parse_str(run)?.get_version_num();
+    let guide = version == 5
+        || uri.starts_with("gs://")
+        || (!uri.starts_with('[') && {
+            let path = artifact(root, &uri)?;
+            let reader = SerializedFileReader::new(File::open(path)?)?;
+            reader
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .columns()
+                .iter()
+                .any(|column| column.name() == "policy_repo")
+        });
+    if guide {
+        let key = format!("{change}:{scenario_id}:{tier}");
+        ensure!(
+            version == 4 || Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()).to_string() == run,
+            "Guide run UUID must match its authoritative ledger identity"
+        );
+        let group: Group = serde_json::from_value(bridge(
+            &json!({"operation":"guide_evidence", "run": {
+                "run_id":run,"change_id":change,"scenario_id":scenario_id,"tier":tier,"episodes":expected,
+                "successes":successes,"mean_reward":mean_reward,"uri":uri,"wall_seconds":seconds,"env":env,"scenario":scenario
+            }}),
+        )?)?;
+        ensure!(
+            group.env == env
+                && group.scenario == scenario
+                && group.episodes.len()
+                    == if tier == "cheap" {
+                        expected
+                    } else {
+                        expected - successes
+                    } as usize,
+            "Guide evidence differs from the authoritative failed run"
+        );
+        let mut seeds = BTreeSet::new();
+        for episode in &group.episodes {
+            compile::guide_telemetry(&env, &episode.telemetry)?;
+            ensure!(
+                episode.seed >= 0 && seeds.insert(episode.seed),
+                "duplicate Guide episode seed"
+            );
+            let frames = episode
+                .frames
+                .as_array()
+                .context("Guide evidence requires frames")?;
+            ensure!(
+                frames.len() == if tier == "cheap" { 1 } else { 8 },
+                "Guide episode has an invalid recorded frame count"
+            );
+            let mut paths = BTreeSet::new();
+            for (index, frame) in frames.iter().enumerate() {
+                ensure!(
+                    frame["index"] == index
+                        && frame.as_object().is_some_and(|object| object.len() == 2),
+                    "Guide frame identity differs"
+                );
+                ensure!(
+                    paths.insert(image(
+                        root,
+                        frame["path"].as_str().context("Guide frame path missing")?
+                    )?),
+                    "duplicate Guide frame path"
+                );
+            }
+        }
+        return Ok(group);
+    }
     let uris: Vec<String> = if uri.starts_with('[') {
         serde_json::from_str(&uri).context("invalid run artifact paths")?
     } else {
@@ -498,10 +587,10 @@ pub fn score_explanations(ledger: &Path, compiled: &Path) -> Result<Option<Value
 
 /// Explains every recorded failed episode of one expensive run and atomically appends its evidence.
 pub fn explain(ledger: &Path, run: &str) -> Result<ExplainReport> {
-    let id = Uuid::parse_str(run).context("run must be a UUIDv4")?;
+    let id = Uuid::parse_str(run).context("run must be an authoritative UUID")?;
     ensure!(
-        id.get_version_num() == 4 && id.to_string() == run,
-        "run must be a canonical UUIDv4"
+        matches!(id.get_version_num(), 4 | 5) && id.to_string() == run,
+        "run must be a canonical UUIDv4 or authoritative Guide UUIDv5"
     );
     let root = data_root()?;
     let connection = Connection::open_with_flags(ledger, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
@@ -537,7 +626,7 @@ pub fn explain(ledger: &Path, run: &str) -> Result<ExplainReport> {
                 "SAM changed original frame identity"
             );
             for key in ["path", "overlay_path"] {
-                let path = png(
+                let path = image(
                     &root,
                     frame[key].as_str().context("SAM frame path missing")?,
                 )?;
@@ -693,7 +782,7 @@ mod tests {
         let ledger = directory.join("ledger.sqlite");
         let connection = crate::ledger::init(&ledger).unwrap();
         connection.execute_batch("INSERT INTO scenarios VALUES('pusht-s01','gym_pusht/PushT-v0','{\"pose_bin\":0,\"lighting\":\"normal\",\"camera_jitter\":false}',0.8);
-            INSERT INTO runs VALUES('cheap','c001','pusht-s01','cheap',3,2,1.0,'cheap.parquet',3.0);").unwrap();
+            INSERT INTO runs VALUES('12345678-1234-4234-8234-123456789abc','c001','pusht-s01','cheap',3,2,1.0,'cheap.parquet',3.0);").unwrap();
         let schema = Arc::new(parse_message_type("message episodes {
             REQUIRED BYTE_ARRAY env (UTF8); REQUIRED BYTE_ARRAY policy (UTF8);
             REQUIRED BYTE_ARRAY change_id (UTF8); REQUIRED BYTE_ARRAY scenario_id (UTF8);
