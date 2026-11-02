@@ -601,3 +601,235 @@ fn report_keeps_markdown_when_push_configuration_is_invalid() {
         .unwrap()
         .contains("Brier: PASS"));
 }
+
+fn report_command(fixture: &Fixture) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_brier"));
+    command
+        .args(["report", "--ledger"])
+        .arg(&fixture.ledger)
+        .args(["--change", "c002", "--out"])
+        .arg(&fixture.out)
+        .env_remove("GITHUB_EVENT_NAME")
+        .env_remove("GITHUB_EVENT_PATH")
+        .env_remove("GITHUB_REPOSITORY");
+    command
+}
+
+fn scenario_fixture(environment: &str, scenario: &str, card: Value) -> Fixture {
+    let fixture = Fixture::new(&["skip"], true);
+    fixture.connection.execute_batch("DROP TRIGGER changes_no_UPDATE; DROP TRIGGER scenarios_no_UPDATE; DROP TRIGGER decisions_no_UPDATE;").unwrap();
+    fixture
+        .connection
+        .execute(
+            "UPDATE changes SET env=?1,card_json=?2 WHERE change_id='c002'",
+            params![environment, card.to_string()],
+        )
+        .unwrap();
+    fixture
+        .connection
+        .execute(
+            "UPDATE scenarios SET env=?1,scenario_id=?2 WHERE scenario_id='pusht-s01'",
+            params![environment, scenario],
+        )
+        .unwrap();
+    fixture
+        .connection
+        .execute(
+            "UPDATE decisions SET scenario_id=?1 WHERE change_id='c002'",
+            [scenario],
+        )
+        .unwrap();
+    fixture
+}
+
+#[test]
+fn report_accepts_guide_flat_desc_without_rewriting_the_card() {
+    let card = json!({"change_id":"c002","env":"pusht","family":"action_scale","scale":0.9,"desc":"Guide gain change"});
+    let fixture = scenario_fixture("gym_pusht/PushT-v0", "pusht-s01", card.clone());
+    let output = report(&fixture.ledger, "c002", &fixture.out, None, None).unwrap();
+    let bundle = output.bundle.unwrap();
+    assert_eq!(bundle["change"]["title"], "Guide gain change");
+    assert_eq!(bundle["change"]["card"], card);
+}
+
+#[test]
+fn report_accepts_canonical_and_legacy_aloha_ids_without_rewriting_them() {
+    for scenario in ["aloha-s01", "aloha_transfer_cube-s01"] {
+        let fixture = scenario_fixture(
+            "gym_aloha/AlohaTransferCube-v0",
+            scenario,
+            json!({"description":"ALOHA change"}),
+        );
+        let output = report(&fixture.ledger, "c002", &fixture.out, None, None).unwrap();
+        let bundle = output.bundle.unwrap();
+        assert_eq!(bundle["change"]["env"], "aloha_transfer_cube");
+        assert_eq!(bundle["pairs"][0]["scenarioId"], scenario);
+        assert!(output.markdown.contains(scenario));
+    }
+}
+
+#[test]
+fn report_rejects_wrong_environment_and_malformed_aloha_ids() {
+    for (environment, scenario) in [
+        ("gym_aloha/AlohaTransferCube-v0", "pusht-s01"),
+        ("gym_pusht/PushT-v0", "aloha-s01"),
+        ("gym_pusht/PushT-v0", "aloha_transfer_cube-s01"),
+        ("gym_aloha/AlohaTransferCube-v0", "aloha-s00"),
+        ("gym_aloha/AlohaTransferCube-v0", "aloha-s1"),
+        ("gym_aloha/AlohaTransferCube-v0", "aloha-s001"),
+        ("gym_aloha/AlohaTransferCube-v0", "aloha-s0x"),
+        ("gym_aloha/AlohaTransferCube-v0", "aloha_transfer_cube-s00"),
+    ] {
+        let fixture = scenario_fixture(
+            environment,
+            scenario,
+            json!({"description":"Wrong scenario"}),
+        );
+        assert!(report(&fixture.ledger, "c002", &fixture.out, None, None)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("scenario ID"));
+        assert!(!fixture.out.exists());
+    }
+}
+
+fn github_pull_request_event() -> Value {
+    json!({"number":412,"repository":{"full_name":"owner/Brier"},
+        "pull_request":{"number":412,"html_url":"https://github.com/owner/Brier/pull/412",
+            "base":{"repo":{"full_name":"owner/Brier"}},
+            "head":{"repo":{"full_name":"contributor/Brier"}}}})
+}
+
+#[test]
+fn report_binds_the_pull_request_link_to_the_actual_github_event_repository() {
+    let fixture = Fixture::new(&["skip"], true);
+    let event = fixture.directory.join("event.json");
+    fs::write(&event, github_pull_request_event().to_string()).unwrap();
+    let result = report_command(&fixture)
+        .env("GITHUB_EVENT_NAME", "pull_request")
+        .env("GITHUB_EVENT_PATH", &event)
+        .env("GITHUB_REPOSITORY", "owner/Brier")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        output["bundle"]["change"]["prUrl"],
+        "https://github.com/owner/Brier/pull/412"
+    );
+}
+
+#[test]
+fn report_keeps_local_and_non_pr_runs_unlinked() {
+    for name in [None, Some("workflow_dispatch"), Some("push")] {
+        let fixture = Fixture::new(&["skip"], true);
+        let event = fixture.directory.join("event.json");
+        fs::write(&event, "not a pull request event").unwrap();
+        let mut command = report_command(&fixture);
+        command
+            .env("GITHUB_EVENT_PATH", event)
+            .env("GITHUB_REPOSITORY", "owner/Brier");
+        if let Some(name) = name {
+            command.env("GITHUB_EVENT_NAME", name);
+        }
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert!(output["bundle"]["change"]["prUrl"].is_null());
+    }
+}
+
+#[test]
+fn report_rejects_malformed_or_cross_repository_pull_request_metadata_before_writing() {
+    for mutation in [
+        "missing_path",
+        "bad_json",
+        "missing_repository",
+        "repository",
+        "base",
+        "number",
+        "zero",
+        "http",
+        "other_repo",
+        "query",
+        "fragment",
+        "credentials",
+        "leading_zero",
+        "port",
+    ] {
+        let fixture = Fixture::new(&["skip"], true);
+        let path = fixture.directory.join("event.json");
+        let mut event = github_pull_request_event();
+        match mutation {
+            "repository" => event["repository"]["full_name"] = json!("another/Brier"),
+            "base" => event["pull_request"]["base"]["repo"]["full_name"] = json!("another/Brier"),
+            "number" => event["pull_request"]["number"] = json!(413),
+            "zero" => {
+                event["number"] = json!(0);
+                event["pull_request"]["number"] = json!(0);
+            }
+            "http" => {
+                event["pull_request"]["html_url"] = json!("http://github.com/owner/Brier/pull/412")
+            }
+            "other_repo" => {
+                event["pull_request"]["html_url"] =
+                    json!("https://github.com/another/Brier/pull/412")
+            }
+            "query" => {
+                event["pull_request"]["html_url"] =
+                    json!("https://github.com/owner/Brier/pull/412?x=1")
+            }
+            "fragment" => {
+                event["pull_request"]["html_url"] =
+                    json!("https://github.com/owner/Brier/pull/412#changed")
+            }
+            "credentials" => {
+                event["pull_request"]["html_url"] =
+                    json!("https://user@github.com/owner/Brier/pull/412")
+            }
+            "leading_zero" => {
+                event["pull_request"]["html_url"] =
+                    json!("https://github.com/owner/Brier/pull/0412")
+            }
+            "port" => {
+                event["pull_request"]["html_url"] =
+                    json!("https://github.com:443/owner/Brier/pull/412")
+            }
+            _ => {}
+        }
+        fs::write(
+            &path,
+            if mutation == "bad_json" {
+                "{".to_string()
+            } else {
+                event.to_string()
+            },
+        )
+        .unwrap();
+        let mut command = report_command(&fixture);
+        command.env("GITHUB_EVENT_NAME", "pull_request");
+        if mutation != "missing_path" {
+            command.env("GITHUB_EVENT_PATH", path);
+        }
+        if mutation != "missing_repository" {
+            command.env("GITHUB_REPOSITORY", "owner/Brier");
+        }
+        let result = command.output().unwrap();
+        assert!(!result.status.success(), "{mutation}");
+        assert!(!fixture.out.exists(), "{mutation}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("GitHub"),
+            "{mutation}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
