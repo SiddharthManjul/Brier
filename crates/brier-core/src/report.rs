@@ -213,6 +213,60 @@ fn endpoint(raw: &str) -> Result<Url> {
     Ok(url)
 }
 
+fn pull_request_url() -> Result<Option<String>> {
+    let name = match env::var("GITHUB_EVENT_NAME") {
+        Ok(name) => name,
+        Err(env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(error).context("invalid GitHub event name"),
+    };
+    if name != "pull_request" {
+        return Ok(None);
+    }
+    let path =
+        env::var("GITHUB_EVENT_PATH").context("GitHub pull_request requires GITHUB_EVENT_PATH")?;
+    let repository =
+        env::var("GITHUB_REPOSITORY").context("GitHub pull_request requires GITHUB_REPOSITORY")?;
+    let mut parts = repository.split('/');
+    let owner = parts.next().unwrap_or("");
+    let repo = parts.next().unwrap_or("");
+    ensure!(
+        !owner.is_empty()
+            && !repo.is_empty()
+            && parts.next().is_none()
+            && owner
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && repo
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            && !matches!(repo, "." | ".."),
+        "GitHub repository must be an owner/repository name"
+    );
+    let event: Value =
+        serde_json::from_slice(&fs::read(path).context("read GitHub pull_request event metadata")?)
+            .context("invalid GitHub pull_request event JSON")?;
+    ensure!(
+        event["repository"]["full_name"].as_str() == Some(repository.as_str())
+            && event["pull_request"]["base"]["repo"]["full_name"].as_str()
+                == Some(repository.as_str()),
+        "GitHub pull_request repository must match GITHUB_REPOSITORY"
+    );
+    let number = event["number"]
+        .as_u64()
+        .filter(|number| *number > 0)
+        .context("GitHub pull_request requires a positive event number")?;
+    ensure!(
+        event["pull_request"]["number"].as_u64() == Some(number),
+        "GitHub pull_request number must match its event number"
+    );
+    let expected = format!("https://github.com/{repository}/pull/{number}");
+    ensure!(
+        event["pull_request"]["html_url"].as_str() == Some(expected.as_str()),
+        "GitHub pull_request URL must be the canonical HTTPS URL for the same repository and number"
+    );
+    Ok(Some(expected))
+}
+
 /// Write an authoritative check summary and optionally push one complete evaluation.
 /// Skipped labels remain private; unknown counterfactual hours are reported as null.
 pub fn report(
@@ -253,11 +307,14 @@ pub fn report(
         _ => anyhow::bail!("unsupported robot environment"),
     };
     let card: Value = serde_json::from_str(&card).context("invalid change card JSON")?;
-    let title = card["description"]
-        .as_str()
-        .filter(|s| !s.trim().is_empty())
-        .context("change card requires a description")?;
     ensure!(card.is_object(), "change card must be an object");
+    let title = card
+        .get("desc")
+        .or_else(|| card.get("description"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .context("change card requires a nonempty desc or description")?;
+    let pr_url = pull_request_url()?;
     let mut query = connection.prepare(
         "SELECT decision_id,scenario_id,model_version,probs_json,lambda,action,created_at
         FROM decisions WHERE change_id=?1 ORDER BY scenario_id",
@@ -369,13 +426,17 @@ pub fn report(
             "skipped decision violates its calibrated threshold"
         );
         let prefix = format!("{env}-s");
+        let suffix = decision.scenario.strip_prefix(&prefix).or_else(|| {
+            if env == "aloha_transfer_cube" {
+                decision.scenario.strip_prefix("aloha-s")
+            } else {
+                None
+            }
+        });
         ensure!(
-            decision
-                .scenario
-                .strip_prefix(&prefix)
-                .is_some_and(|suffix| suffix.len() == 2
-                    && suffix.bytes().all(|b| b.is_ascii_digit())
-                    && suffix != "00"),
+            suffix.is_some_and(|suffix| suffix.len() == 2
+                && suffix.bytes().all(|b| b.is_ascii_digit())
+                && suffix != "00"),
             "scenario ID disagrees with environment"
         );
         let baseline: f64 = connection.query_row(
@@ -561,7 +622,7 @@ pub fn report(
     }
     let mut bundle = None;
     if pending == 0 {
-        let mut value = json!({"change":{"id":change,"env":env,"title":title,"card":card,"prUrl":null,
+        let mut value = json!({"change":{"id":change,"env":env,"title":title,"card":card,"prUrl":pr_url,
             "createdAt":timestamp(&connection,&created)?},"evaluation":{"id":evaluation_id,"changeId":change,
             "verdict":verdict,"alpha":policy.alpha,"lambda":policy.lambda,"evalsRun":completed,"evalsTotal":decisions.len(),
             "hoursSavedPct":hours_saved,"modelVersion":models.into_iter().collect::<Vec<_>>().join(" + "),"createdAt":created_at},
