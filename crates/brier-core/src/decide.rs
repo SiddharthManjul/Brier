@@ -1,12 +1,16 @@
 use crate::{
     cascade, compile, explain, ledger,
-    policy::{calibrate, LabeledChange, PairScore, Policy},
+    policy::{
+        calibrate, calibrate_executed, selected, ExecutedChange, ExecutedPair, Guarantee,
+        LabeledChange, PairScore, Policy, LAMBDA_HIGH, LAMBDA_LOW,
+    },
 };
 use anyhow::{ensure, Context, Result};
 use reqwest::blocking::Client;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -26,6 +30,8 @@ pub struct RiskCalibration {
     pub temperatures: BTreeMap<String, f64>,
     pub probability_calibration_change_ids: Vec<String>,
     pub changes: Vec<LabeledChange>,
+    #[serde(default)]
+    pub executed_changes: Vec<ExecutedChange>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -47,6 +53,7 @@ pub struct DecideReport {
     pub change_id: String,
     pub policy: Policy,
     pub decisions: Vec<Decision>,
+    pub cheap_required: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -98,7 +105,7 @@ fn validate(
     connection: &Connection,
 ) -> Result<()> {
     ensure!(
-        calibration.format_version == 1,
+        matches!(calibration.format_version, 1 | 2),
         "unsupported risk calibration format"
     );
     ensure!(
@@ -154,6 +161,25 @@ fn validate(
                     .is_some_and(|value| value.is_finite() && (0.05..=20.0).contains(value))),
         "three fitted question temperatures in [0.05,20] are required"
     );
+    if calibration.format_version == 2 {
+        let expected = frozen
+            .splits
+            .iter()
+            .filter(|(id, split)| {
+                matches!(split.as_str(), "calibration" | "test") && !probability_fit.contains(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            calibration
+                .changes
+                .iter()
+                .map(|change| change.change_id.clone())
+                .collect::<BTreeSet<_>>()
+                == expected,
+            "executed risk pool must contain every frozen held-out change and exclude fitting/OOD"
+        );
+    }
     for change in &calibration.changes {
         ensure!(
             !training.contains(&change.change_id)
@@ -161,8 +187,9 @@ fn validate(
                 && !frozen
                     .splits
                     .get(&change.change_id)
-                    .is_some_and(|split| matches!(split.as_str(), "train" | "test" | "ood")),
-            "risk calibration overlaps model fitting or held-out test/ood changes"
+                    .is_some_and(|split| matches!(split.as_str(), "train" | "ood")
+                        || (calibration.format_version == 1 && split == "test")),
+            "risk calibration overlaps fitting or unsupported held-out splits"
         );
         let env: String = connection
             .query_row(
@@ -428,18 +455,18 @@ fn publish_refresh(path: &Path, source: &[u8], updated: &RiskCalibration) -> Res
 
 fn action(probability: f64, lambda: f64, draw: f64) -> (&'static str, f64, &'static str) {
     if probability >= lambda {
-        ("expensive", 1.0, "threshold")
+        ("expensive", 1.0, "policy_above_lambda")
     } else if draw < 0.05 {
         ("expensive", 0.05, "exploration")
     } else {
-        ("skip", 0.05, "below_threshold")
+        ("skip", 0.05, "policy_below_lambda")
     }
 }
 
 fn add_review(
     action: &str,
     propensity: f64,
-    reason: &str,
+    _reason: &str,
     review: &Value,
 ) -> Result<(String, f64, String)> {
     let fields = review
@@ -464,11 +491,48 @@ fn add_review(
         Some("run_expensive" | "run_more_cheap") => {
             // Additional evidence uses the full tier: the calibrated cheap feature
             // vector remains the original three episodes.
-            Ok(("expensive".into(), 1.0, "t3_addition".into()))
+            Ok(("expensive".into(), 1.0, "t3_added".into()))
         }
-        Some("no_change") => Ok((action.into(), propensity, reason.into())),
+        Some("no_change") => Ok((action.into(), propensity, "t3_no_change".into())),
         _ => anyhow::bail!("unknown T3 recommendation"),
     }
+}
+
+const ESCALATION_CAP: usize = 2;
+
+fn escalate(
+    decisions: &mut [Decision],
+    lambda: f64,
+    mut review: impl FnMut(&Decision) -> Result<Value>,
+) -> Result<()> {
+    let mut additions = 0;
+    for decision in decisions {
+        let p = decision.probabilities["regressed"]["yes"]
+            .as_f64()
+            .context("invalid escalation probability")?;
+        if decision.action != "skip"
+            || decision.tier_used == "T2-noev"
+            || p < lambda - 0.10
+            || p >= lambda
+        {
+            continue;
+        }
+        if additions == ESCALATION_CAP {
+            decision.reason = "t3_capped".into();
+            continue;
+        }
+        let response = review(decision)?;
+        (decision.action, decision.propensity, decision.reason) = add_review(
+            &decision.action,
+            decision.propensity,
+            &decision.reason,
+            &response,
+        )?;
+        additions += usize::from(decision.action == "expensive");
+        decision.probabilities["escalation"] = response;
+        decision.tier_used.push_str("+T3");
+    }
+    Ok(())
 }
 
 /// Scores every live scenario, applies CRC and exploration, and atomically logs decisions.
@@ -483,6 +547,32 @@ pub fn decide(
     change_id: &str,
     alpha: f64,
 ) -> Result<DecideReport> {
+    decide_guarantee(
+        ledger_path,
+        compiled,
+        calibration,
+        change_id,
+        alpha,
+        Guarantee::Change,
+    )
+}
+
+/// Executes the requested guarantee, returning a nonpersisted cheap plan before evidence exists.
+pub fn decide_guarantee(
+    ledger_path: &Path,
+    compiled: &Path,
+    calibration: &Path,
+    change_id: &str,
+    alpha: f64,
+    guarantee: Guarantee,
+) -> Result<DecideReport> {
+    ensure!(
+        change_id.len() >= 4
+            && change_id.starts_with('c')
+            && change_id[1..].bytes().all(|b| b.is_ascii_digit())
+            && change_id[1..].bytes().any(|b| b != b'0'),
+        "change must start at c001 with at least three digits"
+    );
     let calibration_path = calibration;
     let source = fs::read(calibration_path)?;
     let mut calibration: RiskCalibration = serde_json::from_slice(&source)?;
@@ -523,79 +613,270 @@ pub fn decide(
         |row| row.get(0),
     )?;
     ensure!(existing == 0, "live change already has decisions");
-    refresh(
-        (ledger_path, compiled, calibration_path),
-        &source,
-        &mut calibration,
-        &frozen,
-        &mut connection,
-        change_id,
-        alpha,
-    )?;
-    let policy = calibrate(&calibration.changes, alpha)?;
-    let pairs = compile::compile_live(ledger_path, change_id, compiled)?;
-    let mut decisions = Vec::new();
-    for pair in pairs {
-        let t1 = cascade::predict_t1(&calibration.t1, &pair.features)?;
-        let (tier, model_version, mut probabilities) = if (0.1..=0.9).contains(&t1) {
-            (
-                "T2",
-                calibration.model_version.as_str(),
-                score_t2(&pair, &calibration)?,
-            )
+    let executed = if calibration.format_version == 2 {
+        ensure!(
+            calibration.executed_changes.len() == calibration.changes.len()
+                && calibration
+                    .executed_changes
+                    .iter()
+                    .zip(&calibration.changes)
+                    .all(|(executed, old)| executed.change_id == old.change_id
+                        && executed.pairs.len() == old.pairs.len()
+                        && executed
+                            .pairs
+                            .iter()
+                            .zip(&old.pairs)
+                            .all(|(a, b)| a.scenario_id == b.scenario_id
+                                && a.probability == b.probability
+                                && a.regressed == b.regressed)),
+            "executed risk pool differs from verified labels"
+        );
+        Some(calibrate_executed(
+            &calibration.executed_changes,
+            alpha,
+            guarantee,
+        )?)
+    } else {
+        refresh(
+            (ledger_path, compiled, calibration_path),
+            &source,
+            &mut calibration,
+            &frozen,
+            &mut connection,
+            change_id,
+            alpha,
+        )?;
+        None
+    };
+    let policy = if let Some(executed) = &executed {
+        Policy {
+            alpha,
+            lambda: executed.lambda,
+            calibration_changes: executed.calibration_changes,
+        }
+    } else {
+        calibrate(&calibration.changes, alpha)?
+    };
+    let pairs = if executed.is_some() {
+        compile::compile_live_variant(ledger_path, change_id, compiled, false)?
+    } else {
+        compile::compile_live(ledger_path, change_id, compiled)?
+    };
+    let scores = if executed.is_some() {
+        let cache = calibration_path.with_file_name(format!("{change_id}-noev-plan.json"));
+        let binding = json!({"compiled_sha256": format!("{:x}",Sha256::digest(fs::read(compiled)?)), "calibration_sha256": format!("{:x}",Sha256::digest(&source)), "pairs": pairs});
+        let scores: BTreeMap<String, Value> = if cache.exists() {
+            let saved: Value = serde_json::from_slice(&fs::read(&cache)?)?;
+            ensure!(
+                saved["binding"] == binding
+                    && saved["scores_sha256"]
+                        == format!(
+                            "{:x}",
+                            Sha256::digest(serde_json::to_vec(&saved["scores"])?)
+                        ),
+                "no-evidence cache binding changed"
+            );
+            serde_json::from_value(saved["scores"].clone())?
         } else {
-            (
-                "T1",
-                calibration.t1["model_version"]
-                    .as_str()
-                    .context("missing T1 version")?,
-                json!({"regressed": {"yes": t1, "no": 1.0-t1}}),
-            )
+            let scores = pairs
+                .iter()
+                .map(|pair| Ok((pair.scenario_id.clone(), score_t2(pair, &calibration)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            let mut file = File::create_new(&cache).context("create no-evidence plan cache")?;
+            serde_json::to_writer(
+                &mut file,
+                &json!({"binding":binding,"scores_sha256":format!("{:x}",Sha256::digest(serde_json::to_vec(&scores)?)),"scores":scores}),
+            )?;
+            file.sync_all()?;
+            scores
         };
+        ensure!(
+            scores.len() == pairs.len()
+                && pairs
+                    .iter()
+                    .all(|pair| scores.contains_key(&pair.scenario_id)),
+            "no-evidence cache scenario mismatch"
+        );
+        Some(scores)
+    } else {
+        None
+    };
+    let evidence = compile::compile_live_variant(ledger_path, change_id, compiled, true)?;
+    if let Some(scores) = &scores {
+        let mut cheap_required = Vec::new();
+        for pair in &pairs {
+            let values: BTreeMap<String, BTreeMap<String, f64>> =
+                serde_json::from_value(scores[&pair.scenario_id].clone())?;
+            ensure!(
+                values.len() == pair.questions.len(),
+                "invalid cached question count"
+            );
+            for question in &pair.questions {
+                let kind = question["id"]
+                    .as_str()
+                    .and_then(|id| id.split('/').nth(2))
+                    .context("invalid compiled question")?;
+                let map = values.get(kind).context("invalid cached semantic map")?;
+                let options = question["options"]
+                    .as_object()
+                    .context("invalid options")?
+                    .values()
+                    .map(|v| v.as_str().unwrap_or(""))
+                    .collect::<BTreeSet<_>>();
+                ensure!(
+                    map.keys().map(String::as_str).collect::<BTreeSet<_>>() == options
+                        && map
+                            .values()
+                            .all(|p| p.is_finite() && (0.0..=1.0).contains(p))
+                        && (map.values().sum::<f64>() - 1.0).abs() <= 1.1e-7,
+                    "invalid cached semantic distribution"
+                );
+            }
+            if (LAMBDA_LOW..LAMBDA_HIGH).contains(
+                &scores[&pair.scenario_id]["regressed"]["yes"]
+                    .as_f64()
+                    .context("invalid cached regression probability")?,
+            ) && !evidence
+                .iter()
+                .any(|item| item.scenario_id == pair.scenario_id)
+            {
+                cheap_required.push(pair.scenario_id.clone());
+            }
+        }
+        if !cheap_required.is_empty() {
+            return Ok(DecideReport {
+                change_id: change_id.into(),
+                policy,
+                decisions: Vec::new(),
+                cheap_required,
+            });
+        }
+    }
+    let mut decisions = Vec::new();
+    for pair in &pairs {
+        let (tier, model_version, mut probabilities, noev_probability) =
+            if let Some(scores) = &scores {
+                let noev = scores[&pair.scenario_id]["regressed"]["yes"]
+                    .as_f64()
+                    .context("invalid cached regression probability")?;
+                let uncertain = (LAMBDA_LOW..LAMBDA_HIGH).contains(&noev);
+                let mut probabilities = if uncertain {
+                    score_t2(
+                        evidence
+                            .iter()
+                            .find(|item| item.scenario_id == pair.scenario_id)
+                            .context("missing planned cheap evidence")?,
+                        &calibration,
+                    )?
+                } else {
+                    scores[&pair.scenario_id].clone()
+                };
+                probabilities["noev_probability"] = json!(noev);
+                probabilities["selection_basis"] = json!(if executed.as_ref().unwrap().run_all {
+                    "run_all_uncertifiable"
+                } else if noev >= LAMBDA_HIGH {
+                    "confident_high"
+                } else if noev < LAMBDA_LOW {
+                    "confident_low"
+                } else {
+                    "ev_threshold"
+                });
+                (
+                    if uncertain { "T2" } else { "T2-noev" },
+                    calibration.model_version.as_str(),
+                    probabilities,
+                    Some(noev),
+                )
+            } else {
+                let t1 = cascade::predict_t1(&calibration.t1, &pair.features)?;
+                if (0.1..=0.9).contains(&t1) {
+                    (
+                        "T2",
+                        calibration.model_version.as_str(),
+                        score_t2(pair, &calibration)?,
+                        None,
+                    )
+                } else {
+                    (
+                        "T1",
+                        calibration.t1["model_version"]
+                            .as_str()
+                            .context("missing T1 version")?,
+                        json!({"regressed":{"yes":t1,"no":1.0-t1}}),
+                        None,
+                    )
+                }
+            };
         let probability = probabilities["regressed"]["yes"]
             .as_f64()
             .context("missing semantic regression probability")?;
-        probabilities["policy"] = serde_json::to_value(&policy)?;
-        probabilities["calibration"] = json!({
-            "model_version": calibration.model_version,
-            "t1_model_version": calibration.t1["model_version"],
-            "risk_change_ids": calibration.changes.iter().map(|change| &change.change_id).collect::<Vec<_>>()
-        });
+        probabilities["policy"] = if let Some(executed) = &executed {
+            serde_json::to_value(executed)?
+        } else {
+            serde_json::to_value(&policy)?
+        };
+        probabilities["calibration"] = json!({"model_version":calibration.model_version,"t1_model_version":calibration.t1["model_version"],"risk_change_ids":calibration.changes.iter().map(|change| &change.change_id).collect::<Vec<_>>()});
         let mut random_bytes = [0_u8; 8];
         random_bytes[..6].copy_from_slice(&Uuid::new_v4().as_bytes()[..6]);
         let draw = u64::from_le_bytes(random_bytes) as f64 / (1_u64 << 48) as f64;
-        let (action, propensity, reason) = action(probability, policy.lambda, draw);
-        let (mut action, mut propensity, mut reason) =
-            (action.to_string(), propensity, reason.to_string());
-        let mut tier = tier.to_string();
-        if tier == "T2" && (0.1..=0.9).contains(&probability) {
-            let evidence = explain::cheap_evidence(ledger_path, change_id, &pair.scenario_id)?;
-            let prompt = compile::escalation_prompt(
-                &serde_json::to_value(&pair)?,
-                &probabilities,
-                policy.lambda,
-                &evidence,
-            )?;
-            let review = explain::bridge(&json!({
-                "operation": "escalate", "prompt": prompt, "frames": evidence["frames"]
-            }))?;
-            (action, propensity, reason) = add_review(&action, propensity, &reason, &review)?;
-            probabilities["escalation"] = review;
-            tier = "T2+T3".into();
-        }
+        let (action, propensity, reason) =
+            if let (Some(executed), Some(noev)) = (&executed, noev_probability) {
+                if selected(
+                    &ExecutedPair {
+                        scenario_id: pair.scenario_id.clone(),
+                        probability,
+                        noev_probability: noev,
+                        regressed: false,
+                    },
+                    executed,
+                ) {
+                    ("expensive", 1.0, "policy_above_lambda")
+                } else if draw < 0.05 {
+                    ("expensive", 0.05, "exploration")
+                } else if noev < LAMBDA_LOW {
+                    ("skip", 0.05, "cheap_skipped_confident_low")
+                } else {
+                    ("skip", 0.05, "policy_below_lambda")
+                }
+            } else {
+                action(probability, policy.lambda, draw)
+            };
         decisions.push(Decision {
             decision_id: Uuid::new_v4().to_string(),
             change_id: change_id.into(),
-            scenario_id: pair.scenario_id,
-            tier_used: tier,
+            scenario_id: pair.scenario_id.clone(),
+            tier_used: tier.into(),
             model_version: model_version.into(),
             probabilities,
             lambda: policy.lambda,
-            action,
+            action: action.into(),
             propensity,
-            reason,
+            reason: reason.into(),
         });
     }
+    decisions.sort_by(|a, b| {
+        b.probabilities["regressed"]["yes"]
+            .as_f64()
+            .unwrap()
+            .total_cmp(&a.probabilities["regressed"]["yes"].as_f64().unwrap())
+            .then_with(|| a.scenario_id.cmp(&b.scenario_id))
+    });
+    escalate(&mut decisions, policy.lambda, |decision| {
+        let pair = evidence
+            .iter()
+            .find(|pair| pair.scenario_id == decision.scenario_id)
+            .context("missing escalation pair")?;
+        let evidence = explain::cheap_evidence(ledger_path, change_id, &decision.scenario_id)?;
+        let prompt = compile::escalation_prompt(
+            &serde_json::to_value(pair)?,
+            &decision.probabilities,
+            policy.lambda,
+            &evidence,
+        )?;
+        explain::bridge(
+            &json!({"operation":"escalate","prompt":prompt,"frames":evidence["frames"]}),
+        )
+    })?;
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_secs()
@@ -633,6 +914,7 @@ pub fn decide(
         change_id: change_id.into(),
         policy,
         decisions,
+        cheap_required: Vec::new(),
     })
 }
 
@@ -641,6 +923,37 @@ mod tests {
     use super::{action, add_review, independently_complete, publish_refresh, RiskCalibration};
     use serde_json::json;
     use std::{collections::BTreeMap, fs};
+
+    #[test]
+    fn escalation_adds_only_two_highest_band_pairs_and_fails_loudly() {
+        let mut decisions = (0..5)
+            .map(|n| super::Decision {
+                decision_id: n.to_string(),
+                change_id: "c999".into(),
+                scenario_id: format!("pusht-s{:02}", n + 1),
+                tier_used: "T2".into(),
+                model_version: "fixed".into(),
+                probabilities: json!({"regressed":{"yes":0.79-n as f64*0.01}}),
+                lambda: 0.8,
+                action: "skip".into(),
+                propensity: 0.05,
+                reason: "policy_below_lambda".into(),
+            })
+            .collect::<Vec<_>>();
+        let mut seen = Vec::new();
+        super::escalate(&mut decisions,0.8,|decision| { seen.push(decision.scenario_id.clone()); Ok(json!({"model":"muse-spark-1.3-contributor","recommend":"run_expensive","rationale":"recorded evidence","cost_usd":null})) }).unwrap();
+        assert_eq!(seen, vec!["pusht-s01", "pusht-s02"]);
+        assert_eq!(
+            decisions.iter().filter(|d| d.reason == "t3_added").count(),
+            2
+        );
+        assert_eq!(
+            decisions.iter().filter(|d| d.reason == "t3_capped").count(),
+            3
+        );
+        decisions[0].action = "skip".into();
+        assert!(super::escalate(&mut decisions, 0.8, |_| anyhow::bail!("provider error")).is_err());
+    }
 
     #[test]
     fn independent_collection_requires_all_environment_scenarios() {
@@ -678,6 +991,7 @@ mod tests {
             temperatures: BTreeMap::new(),
             probability_calibration_change_ids: Vec::new(),
             changes: Vec::new(),
+            executed_changes: Vec::new(),
         };
         fs::write(&path, b"newer caller content").unwrap();
         assert!(publish_refresh(&path, b"original content", &updated)
@@ -695,29 +1009,35 @@ mod tests {
 
     #[test]
     fn threshold_equality_and_exploration_propensities_are_exact() {
-        assert_eq!(action(0.4, 0.4, 0.9), ("expensive", 1.0, "threshold"));
+        assert_eq!(
+            action(0.4, 0.4, 0.9),
+            ("expensive", 1.0, "policy_above_lambda")
+        );
         assert_eq!(action(0.3, 0.4, 0.049), ("expensive", 0.05, "exploration"));
-        assert_eq!(action(0.3, 0.4, 0.05), ("skip", 0.05, "below_threshold"));
+        assert_eq!(
+            action(0.3, 0.4, 0.05),
+            ("skip", 0.05, "policy_below_lambda")
+        );
     }
 
     #[test]
-    fn t3_can_only_add_evaluations_and_preserves_no_change_propensities() {
+    fn t3_can_only_add_evaluations_and_records_no_change_propensities() {
         for (action, propensity, reason) in [
-            ("expensive", 1.0, "threshold"),
+            ("expensive", 1.0, "policy_above_lambda"),
             ("expensive", 0.05, "exploration"),
-            ("skip", 0.05, "below_threshold"),
+            ("skip", 0.05, "policy_below_lambda"),
         ] {
             let mut review = json!({"model":"muse-spark-1.3-contributor",
                 "recommend":"no_change","rationale":"observed evidence","cost_usd":null});
             assert_eq!(
                 add_review(action, propensity, reason, &review).unwrap(),
-                (action.into(), propensity, reason.into())
+                (action.into(), propensity, "t3_no_change".into())
             );
             for recommendation in ["run_expensive", "run_more_cheap"] {
                 review["recommend"] = json!(recommendation);
                 assert_eq!(
                     add_review(action, propensity, reason, &review).unwrap(),
-                    ("expensive".into(), 1.0, "t3_addition".into())
+                    ("expensive".into(), 1.0, "t3_added".into())
                 );
             }
             review["recommend"] = json!("skip");
