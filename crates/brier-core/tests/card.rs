@@ -159,3 +159,34 @@ fn card_cli_emits_the_identity_proof_consumed_by_robot_ci() {
     assert_eq!(report["t0_identical"], true);
     assert_eq!(report["identity"]["before"], report["identity"]["after"]);
 }
+
+#[test]
+fn guide_policy_parameters_preserve_exact_identity_without_legacy_reinterpretation() {
+    let f = Fixture::new();
+    for family in [
+        "action_scale\n    params: {s: 0.9}",
+        "action_bias\n    params: {b: 2}",
+        "camera_shift\n    params: {shift: 4, angle: 3}",
+        "occlusion\n    params: {fraction: 0.2}",
+    ] {
+        f.write("Guide-native policy change", family, "info");
+        let report = card(&f.before, &f.after, "c130").unwrap();
+        assert!(!report.t0_identical);
+        assert_eq!(report.identity.before, report.identity.after);
+        assert_eq!(
+            report.card["families"],
+            serde_json::to_value(&report.identity.after.effective_families).unwrap()
+        );
+        assert_eq!(report.card["description"], "Guide-native policy change");
+    }
+    for family in [
+        "action_scale\n    params: {s: -1}",
+        "action_bias\n    params: {b: -1}",
+        "camera_shift\n    params: {shift: 1.5, angle: 3}",
+        "occlusion\n    params: {fraction: 1.1}",
+        "action_scale\n    params: {s: 0.9, scale: 0.9}",
+    ] {
+        f.write("Invalid Guide parameters", family, "info");
+        assert!(card(&f.before, &f.after, "c130").is_err(), "{family}");
+    }
+}
