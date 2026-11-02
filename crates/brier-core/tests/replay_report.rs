@@ -243,3 +243,147 @@ fn report_rejects_duplicate_partial_and_invalid_cheap_results_without_changing_s
         fs::remove_dir_all(directory).unwrap();
     }
 }
+
+fn guide3_fixture() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let (directory, ledger_path, compiled, scores) = fixture();
+    let connection = rusqlite::Connection::open(&ledger_path).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER scenarios_no_UPDATE; UPDATE scenarios SET env='pusht';")
+        .unwrap();
+    let source: Value = serde_json::from_slice(&fs::read(scores).unwrap()).unwrap();
+    let mut compiled_rows = String::new();
+    let run = directory.join("run");
+    let probs = run.join("probs_temp");
+    fs::create_dir_all(&probs).unwrap();
+    let mut probability_rows = std::collections::BTreeMap::<&str, String>::new();
+    for i in 1..=40 {
+        let change = format!("c{i:03}");
+        let split = if i <= 19 {
+            "calibration"
+        } else if i == 40 {
+            "ood"
+        } else {
+            "test"
+        };
+        connection
+            .execute(
+                "INSERT INTO changes(change_id,env,card_json) VALUES (?1,'pusht',?2)",
+                params![
+                    change,
+                    json!({"families":[{"family":"action_latency","params":{"k":1}}]}).to_string()
+                ],
+            )
+            .unwrap();
+        for variant in ["ev", "noev"] {
+            let id = format!("{change}:pusht-s01:regressed:{variant}");
+            let row = json!({"id":id,"pair_id":format!("{change}:pusht-s01"),"change_id":change,"scenario_id":"pusht-s01","split":split,"question":"regressed","variant":variant,"options":["yes","no"],"label":if i==40{"B"}else{"A"}});
+            compiled_rows.push_str(&format!("{row}\n"));
+            let p = if variant == "noev" {
+                0.5
+            } else {
+                source["strategies"]["Full cascade"]["probabilities"]
+                    [format!("{change}/pusht-s01/regressed/cheap")]
+                .as_f64()
+                .unwrap()
+            };
+            let prediction = json!({"id":id,"split":split,"question":"regressed","variant":variant,"options":["yes","no"],"label":row["label"],"probs":{"A":p,"B":1.0-p},"model":"FT","revision":"pin","temperature":1.0});
+            probability_rows
+                .entry(split)
+                .or_default()
+                .push_str(&format!("{prediction}\n"));
+        }
+    }
+    fs::write(&compiled, compiled_rows).unwrap();
+    for (split, rows) in probability_rows {
+        fs::write(probs.join(format!("{split}.jsonl")), rows).unwrap();
+    }
+    let partition = json!({"fit_change_ids":["c001"],"risk_change_ids":["c002"]});
+    fs::write(
+        run.join("run_meta.json"),
+        json!({"revision":"pin","calibration_partition":partition}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        run.join("metrics.json"),
+        json!({"model":"FT","calibration_partition":partition}).to_string(),
+    )
+    .unwrap();
+    fs::write(run.join("temps.json"), json!({"regressed":1.0}).to_string()).unwrap();
+    (directory, ledger_path, compiled, probs)
+}
+
+#[test]
+fn guide3_report_reads_exact_tempered_variants_and_excludes_fitting_and_ood_from_pool() {
+    use brier_core::{policy::Guarantee, replay_report::write_guide3_report};
+    let (directory, ledger, compiled, probs) = guide3_fixture();
+    let original = fs::read(&ledger).unwrap();
+    let output = directory.join("guide3.json");
+    write_guide3_report(
+        &ledger,
+        &compiled,
+        &probs,
+        &output,
+        &[0.05, 0.1],
+        Guarantee::Change,
+        42,
+    )
+    .unwrap();
+    let report: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+    let guide = &report["guide3"];
+    assert_eq!(guide["heldout_changes"], 38);
+    assert_eq!(guide["excluded_fit_change_ids"], json!(["c001"]));
+    assert_eq!(guide["t0_credit_verified"], false);
+    assert_eq!(guide["alphas"]["0.05"]["production_policy"]["lambda"], 0.2);
+    assert_eq!(
+        guide["alphas"]["0.05"]["splits"].as_array().unwrap().len(),
+        20
+    );
+    let production = &guide["alphas"]["0.05"]["production_pool_descriptive"];
+    assert_eq!(production["actual_expensive_runs"], 38);
+    assert_eq!(production["cheap_runs"], 38);
+    assert!((production["eval_hours_saved"].as_f64().unwrap() + 0.075).abs() < 1e-12);
+    assert_eq!(production["unconditional_change_miss_rate"], 0.0);
+    assert_eq!(guide["alphas"]["0.05"]["ood"]["changes"], 1);
+    assert_eq!(fs::read(ledger).unwrap(), original);
+    assert_eq!(guide["source_sha256"].as_object().unwrap().len(), 8);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn guide3_report_rejects_missing_noev_scores_and_changed_temperature_before_output() {
+    use brier_core::{policy::Guarantee, replay_report::write_guide3_report};
+    for mutation in ["missing", "temperature", "model"] {
+        let (directory, ledger, compiled, probs) = guide3_fixture();
+        let path = probs.join("test.jsonl");
+        let mut rows: Vec<Value> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        match mutation {
+            "missing" => {
+                rows.pop();
+            }
+            "temperature" => rows[0]["temperature"] = json!(2.0),
+            _ => rows[0]["model"] = json!("zero-shot"),
+        }
+        fs::write(
+            &path,
+            rows.iter().map(|r| format!("{r}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let output = directory.join("bad.json");
+        assert!(write_guide3_report(
+            &ledger,
+            &compiled,
+            &probs,
+            &output,
+            &[0.05],
+            Guarantee::Change,
+            42
+        )
+        .is_err());
+        assert!(!output.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
