@@ -387,3 +387,132 @@ def test_run_cli_forwards_only_specified_flags_and_preserves_exit_status(monkeyp
         farm._run_cli(["run", "--env", "aloha", "--phase", "pilot", "--shard", "2", "--n-shards", "44", "--procs", "4", "--max-hours", "5.5"])
     assert result.value.code == 3
     assert calls == [("aloha", "pilot", 2, 44, 4, 5.5)]
+
+
+@pytest.fixture
+def extension(manifests: dict, monkeypatch: pytest.MonkeyPatch) -> dict:
+    import shutil
+
+    from brier_sim.changes import _grid, extend_changes
+    source = manifests['root']
+    for env in ('pusht', 'aloha'):
+        magnitudes = {family: [{'params': params, 'mean_drop': .1} for params in values]
+                      for family, values in _grid(env).items()}
+        (source / f'manifests/magnitudes_{env}.json').write_text(json.dumps(magnitudes))
+        for i in range(1, 17):
+            path = source / f'episodes/env={env}/tier=baseline/change=base/{env}-s{i:02}.parquet'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f'preserved-baseline-{env}-{i}'.encode())
+    target = source / 'heldout-extension'
+    shutil.copytree(source / 'manifests', target / 'manifests')
+    shutil.copytree(source / 'episodes', target / 'episodes')
+    manifest = {'schema': 'brier-heldout-extension-v1', 'seed': 2027, 'source_root': str(source),
+                'source_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                                  for p in sorted((source / 'manifests').iterdir())},
+                'changes_sha256': {}, 'appended_change_ids': {},
+                'baseline_sha256': {str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
+                                    for p in sorted((source / 'episodes').rglob('*.parquet'))}}
+    for env, start in (('pusht', 161), ('aloha', 181)):
+        magnitudes = json.loads((source / f'manifests/magnitudes_{env}.json').read_text())
+        cards = extend_changes(env, 20, 2027, magnitudes, start)
+        path = target / f'manifests/changes_{env}.jsonl'
+        path.write_bytes(path.read_bytes() + ''.join(json.dumps(card) + '\n' for card in cards).encode())
+        manifest['changes_sha256'][env] = hashlib.sha256(path.read_bytes()).hexdigest()
+        manifest['appended_change_ids'][env] = [card['change_id'] for card in cards]
+    (target / 'manifests/extension.json').write_text(json.dumps(manifest))
+    monkeypatch.setenv('BRIER_DATA', str(target))
+    return {'root': target, 'source': source, 'manifest': manifest}
+
+
+@pytest.mark.parametrize('env,first,last', [('pusht', 'c161', 'c180'), ('aloha', 'c181', 'c200')])
+def test_extension_plans_only_new_global_ids_and_preserves_original_bytes(
+    env: str, first: str, last: str, extension: dict,
+) -> None:
+    before = {str(p): p.read_bytes() for p in extension['source'].rglob('*') if p.is_file()}
+    groups = farm._guide_plan(env, 'pairs')
+    assert len(groups) == 60 and all(len(group) == 8 for group in groups)
+    for group in groups:
+        assert len({key[0]['change_id'] for key in group}) == 1
+        assert [key[2] for key in group] == ['cheap', 'expensive'] * 4
+        assert [key[1]['scenario_id'] for key in group[::2]] == [key[1]['scenario_id'] for key in group[1::2]]
+    assert groups[0][0][0]['change_id'] == first and groups[-1][0][0]['change_id'] == last
+    assert all(int(key[0]['change_id'][1:]) > 160 for group in groups for key in group)
+    partitioned = [{_uri(env, key) for group in groups[shard::7] for key in group} for shard in range(7)]
+    assert sum(map(len, partitioned)) == len(set.union(*partitioned)) == 20 * 12 * 2
+    assert {str(p): p.read_bytes() for p in extension['source'].rglob('*') if p.is_file()} == before
+    assert groups == farm._guide_plan(env, 'pairs')
+    with pytest.raises(ValueError, match='new pairs only'):
+        farm._guide_plan(env, 'baselines')
+    with pytest.raises(ValueError, match='new pairs only'):
+        farm._guide_plan(env, 'pilot')
+
+
+@pytest.mark.parametrize('fault', ['prefix', 'source-hash', 'copy', 'baseline-copy', 'baseline-source',
+                                   'baseline-unbound', 'ids', 'seed', 'card-seed', 'count', 'null', 'root'])
+def test_extension_fails_on_ambiguous_provenance_or_changed_frozen_inputs(fault: str, extension: dict) -> None:
+    root, source, manifest = extension['root'], extension['source'], extension['manifest']
+    path = root / 'manifests/changes_pusht.jsonl'
+    cards = [json.loads(line) for line in path.read_text().splitlines()]
+    if fault == 'prefix':
+        cards[0]['desc'] += ' changed'
+    elif fault == 'source-hash':
+        manifest['source_sha256']['changes_pusht.jsonl'] = '0' * 64
+    elif fault == 'copy':
+        (root / 'manifests/magnitudes_aloha.json').write_text('{}')
+    elif fault.startswith('baseline-'):
+        key = max(manifest['baseline_sha256'])
+        if fault == 'baseline-unbound':
+            del manifest['baseline_sha256'][key]
+        else:
+            ((root if fault == 'baseline-copy' else source) / key).write_bytes(b'changed')
+    elif fault == 'ids':
+        cards[-1]['change_id'] = 'c081'
+        manifest['appended_change_ids']['pusht'][-1] = 'c081'
+    elif fault == 'seed':
+        manifest['seed'] = 2028
+    elif fault == 'card-seed':
+        cards[-1]['seed'] += 1
+    elif fault == 'count':
+        manifest['appended_change_ids']['aloha'].pop()
+    elif fault == 'root':
+        manifest['source_root'] = str(root)
+    if fault in {'prefix', 'ids', 'card-seed'}:
+        path.write_text(''.join(json.dumps(card) + '\n' for card in cards))
+        manifest['changes_sha256']['pusht'] = hashlib.sha256(path.read_bytes()).hexdigest()
+    (root / 'manifests/extension.json').write_text(json.dumps(None if fault == 'null' else manifest))
+    with pytest.raises(ValueError, match='extension|frozen|manifest'):
+        farm._guide_plan('pusht', 'pairs')
+
+
+def test_extension_remote_planner_checks_read_only_exact_sources(extension: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    remote_root, remote_source = 'gs://private/heldout', 'gs://private/original'
+    manifest = extension['manifest']
+    manifest['source_root'] = remote_source
+    (extension['root'] / 'manifests/extension.json').write_text(json.dumps(manifest))
+    def location(uri: str) -> Path:
+        for prefix, root in ((remote_root, extension['root']), (remote_source, extension['source'])):
+            if uri.startswith(prefix + '/'):
+                return root / uri[len(prefix) + 1:]
+        raise AssertionError(f'unexpected remote read: {uri}')
+    monkeypatch.setattr(farm, '_read', lambda uri: location(uri).read_bytes())
+    monkeypatch.setattr(storage, 'exists', lambda uri: location(uri).is_file())
+    monkeypatch.setenv('BRIER_DATA', remote_root)
+    groups = farm._guide_plan('aloha', 'pairs')
+    assert len(groups) == 60 and groups[0][0][0]['change_id'] == 'c181'
+    assert all(_uri('aloha', key).startswith(remote_root + '/') for group in groups for key in group)
+
+
+def test_extension_forty_change_pool_uses_disjoint_new_ranges(extension: dict) -> None:
+    from brier_sim.changes import extend_changes
+    manifest, root, source = extension['manifest'], extension['root'], extension['source']
+    for env, first in (('pusht', 161), ('aloha', 201)):
+        name = f'manifests/changes_{env}.jsonl'
+        magnitudes = json.loads((source / f'manifests/magnitudes_{env}.json').read_text())
+        cards = extend_changes(env, 40, 2027, magnitudes, first)
+        (root / name).write_bytes((source / name).read_bytes() + ''.join(json.dumps(c) + '\n' for c in cards).encode())
+        manifest['changes_sha256'][env] = hashlib.sha256((root / name).read_bytes()).hexdigest()
+        manifest['appended_change_ids'][env] = [card['change_id'] for card in cards]
+    (root / 'manifests/extension.json').write_text(json.dumps(manifest))
+    ids = [{group[0][0]['change_id'] for group in farm._guide_plan(env, 'pairs')} for env in ('pusht', 'aloha')]
+    assert len(ids[0]) == len(ids[1]) == 40 and ids[0].isdisjoint(ids[1])
+    assert min(ids[0]) == 'c161' and max(ids[1]) == 'c240'
