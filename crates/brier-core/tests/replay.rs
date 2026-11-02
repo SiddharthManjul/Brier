@@ -163,3 +163,91 @@ fn rejects_training_ood_duplicates_and_invalid_costs() {
     assert!(replay(&changes[..19], DEFAULT_ALPHA, 1).is_err());
     assert!(replay(&[], DEFAULT_ALPHA, 1).is_err());
 }
+
+#[test]
+fn executed_replay_runs_exactly_one_four_job_wave_then_preserves_the_block_verdict() {
+    use brier_core::policy::{calibrate_executed, ExecutedChange, ExecutedPair, Guarantee};
+    use brier_core::replay::execute_change;
+    let change = ExecutedChange {
+        change_id: "c100".into(),
+        pairs: (1..=12)
+            .map(|i| ExecutedPair {
+                scenario_id: format!("s{i:02}"),
+                probability: 0.8,
+                noev_probability: 0.95,
+                regressed: i == 1 || i == 12,
+            })
+            .collect(),
+    };
+    let calibration: Vec<_> = (0..30)
+        .map(|i| {
+            let mut c = change.clone();
+            c.change_id = format!("c{i:03}");
+            c
+        })
+        .collect();
+    let policy = calibrate_executed(&calibration, 0.05, Guarantee::Change).unwrap();
+    let result = execute_change(&change, &policy, 42).unwrap();
+    assert_eq!(result.iter().filter(|d| d.ran).count(), 4);
+    assert_eq!(result.iter().filter(|d| d.selected).count(), 12);
+    assert_eq!(
+        result
+            .iter()
+            .filter(|d| d.reason == "early_stop_not_needed")
+            .count(),
+        8
+    );
+    assert_eq!(result[0].observed_regressed, Some(true));
+    assert!(result.iter().all(|d| !d.cheap_run));
+    let scenario = calibrate_executed(&calibration, 0.05, Guarantee::Scenario).unwrap();
+    assert_eq!(
+        execute_change(&change, &scenario, 42)
+            .unwrap()
+            .iter()
+            .filter(|d| d.ran)
+            .count(),
+        12
+    );
+}
+
+#[test]
+fn adaptive_cheap_mask_and_whole_change_partitions_are_fixed_and_seeded() {
+    use brier_core::policy::{calibrate_executed, ExecutedChange, ExecutedPair, Guarantee};
+    use brier_core::replay::{execute_change, heldout_partitions};
+    let change = ExecutedChange {
+        change_id: "c100".into(),
+        pairs: [0.019, 0.02, 0.899, 0.9]
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| ExecutedPair {
+                scenario_id: format!("s{i:02}"),
+                probability: 0.1,
+                noev_probability: p,
+                regressed: false,
+            })
+            .collect(),
+    };
+    let calibration: Vec<_> = (0..30)
+        .map(|i| {
+            let mut c = change.clone();
+            c.change_id = format!("c{i:03}");
+            c
+        })
+        .collect();
+    let policy = calibrate_executed(&calibration, 0.05, Guarantee::Change).unwrap();
+    let result = execute_change(&change, &policy, 42).unwrap();
+    assert_eq!(result.iter().filter(|d| d.cheap_run).count(), 2);
+    assert!(result[3].policy_selected);
+    assert!(!result[0].policy_selected);
+    let ids: Vec<_> = (0..40).map(|i| format!("c{i:03}")).collect();
+    let parts = heldout_partitions(&ids).unwrap();
+    assert_eq!(parts.len(), 20);
+    for (cal, test) in &parts {
+        assert_eq!(cal.len(), 30);
+        assert_eq!(test.len(), 10);
+        assert!(!cal.iter().any(|id| test.contains(id)));
+    }
+    let mut reverse = ids;
+    reverse.reverse();
+    assert_eq!(parts, heldout_partitions(&reverse).unwrap());
+}
