@@ -88,3 +88,52 @@ test("readStrategies preserves nullable measurements and legitimate cost overrun
   assert.equal(strategy.oodEce, null);
   assert.deepEqual(strategy.curve, [{ saved: -20, missed: 5 }]);
 });
+
+test("readGuide3 keeps failed diagnostics separate and rejects inconsistent risk or gate claims", async () => {
+  const { readGuide3 } = await import("../lib/report.ts");
+  const make = () => ({ guide3: {
+    guarantee: "change", guarantee_denominator: "all changes; conditional regressing-change misses are measured separately",
+    heldout_changes: 42, t0_credit_verified: false, wave_size: 4,
+    alphas: { "0.05": {
+      production_policy: { alpha: .05, lambda: .228, risk_bound: .0465, calibration_changes: 42,
+        guarantee: "change", guarantee_metric: "unconditional_change_miss", certified: true, run_all: false },
+      splits: Array.from({ length: 20 }, (_, seed) => ({ seed })), splits_within_alpha: 14,
+      required_splits_within_alpha: 18, replay_gate_passed: false,
+      summary: { eval_hours_saved: { mean: .72, worst: .63 },
+        unconditional_change_miss_rate: { mean: .04, worst: .27 },
+        conditional_regressing_change_miss_rate: { mean: .058, worst: .43 },
+        actual_scenario_miss_rate: { mean: .65, worst: .74 },
+        savings_breakdown_mean_baseline_fraction: { t0_saved_seconds: 0,
+          adaptive_cheap_saved_seconds: .008, cheap_overhead_seconds: .067,
+          threshold_saved_seconds: .37, early_stop_saved_seconds: .43,
+          exploration_selected_overhead_seconds: .011 } },
+    } },
+  } });
+  assert.equal(readGuide3({}), null);
+  const report = readGuide3(make())!;
+  assert.equal(report.alphas[0].passed, false);
+  assert.equal(report.alphas[0].within, 14);
+  assert.equal(report.alphas[0].allChangeMiss.mean, .04);
+  assert.equal(report.alphas[0].conditionalMiss.mean, .058);
+  assert.equal(report.alphas[0].scenarioMiss.mean, .65);
+  const mutate = (path: string[], value: unknown) => {
+    const input = make();
+    let target: Record<string, unknown> = input;
+    for (const key of path.slice(0, -1)) target = target[key] as Record<string, unknown>;
+    target[path.at(-1)!] = value;
+    assert.throws(() => readGuide3(input), `must reject ${path.join(".")}`);
+  };
+  const row = ["guide3", "alphas", "0.05"];
+  for (const [field, value] of [["replay_gate_passed", "false"], ["replay_gate_passed", true],
+    ["splits_within_alpha", 21], ["required_splits_within_alpha", 0], ["splits", []]] as const) {
+    mutate([...row, field], value);
+  }
+  for (const [field, value] of [["lambda", NaN], ["risk_bound", .1], ["run_all", true],
+    ["certified", "true"], ["guarantee_metric", "conditional_change_miss"], ["calibration_changes", 49]] as const) {
+    mutate([...row, "production_policy", field], value);
+  }
+  mutate([...row, "summary", "eval_hours_saved", "mean"], "pending");
+  mutate([...row, "summary", "actual_scenario_miss_rate", "worst"], -.1);
+  mutate([...row, "summary", "conditional_regressing_change_miss_rate", "mean"], 2);
+  mutate([...row, "summary", "savings_breakdown_mean_baseline_fraction", "t0_saved_seconds"], .3);
+});
