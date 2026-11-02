@@ -21,7 +21,7 @@ from lerobot.envs.utils import add_envs_task, preprocess_observation
 from PIL import Image
 
 from brier_sim import envs, storage
-from brier_sim.changes import action_hook, apply_change, obs_hook
+from brier_sim.changes import _PARAMS, action_hook, apply_change, obs_hook
 from brier_sim.scenarios import (
     _rng,
     apply_scenario,
@@ -92,6 +92,9 @@ def run_episodes(
     change: dict[str, Any] | None = None, scenario: dict[str, Any] | None = None, revision: str | None = None,
 ) -> Path:
     """Run seeded pretrained-policy episodes and save their raw records to Parquet."""
+    if isinstance(change, dict) and "desc" in change:
+        return _run_guide_live(env, policy, episodes, seed, change_id, scenario_id, tier,
+                               change=change, scenario=scenario, revision=revision)
     if env == "gym_pusht/PushT-v0":
         expected_policy, scenario_prefix = "lerobot/diffusion_pusht", "pusht"
     elif env == "gym_aloha/AlohaTransferCube-v0":
@@ -239,7 +242,8 @@ def _table_contact(raw: Any) -> bool:
     return False
 
 
-def _guide_episode(loaded: tuple, env: str, scenario: dict, tier: str, seed: int) -> tuple[dict, list]:
+def _guide_episode(loaded: tuple, env: str, scenario: dict, tier: str, seed: int, *,
+                   capture_cheap_frame: bool = False) -> tuple[dict, list]:
     vector, policy, change_state = loaded
     child, raw = vector.envs[0], vector.envs[0].unwrapped
     horizon = child._max_episode_steps // (2 if tier == "cheap" else 1)
@@ -298,7 +302,88 @@ def _guide_episode(loaded: tuple, env: str, scenario: dict, tier: str, seed: int
            "table_contact_steps": contacts if env == "aloha" else None,
            "action_flip_rate": float(flips.sum() / len(flips)) if len(flips) else 0.,
            "terminal_state_json": json.dumps(_guide_terminal(raw, env), allow_nan=False), "keyframes_uri": None}
+    if tier == "cheap" and capture_cheap_frame:
+        return row, [_guide_frame(observation, env)]
     return row, [frames[index] for index in frame_steps] if frames else []
+
+
+def _run_guide_live(env: str, policy: str, episodes: int, seed: int,
+                    change_id: str, scenario_id: str, tier: str, *, change: dict,
+                    scenario: dict | None, revision: str | None) -> Path:
+    names = {"gym_pusht/PushT-v0": "pusht", "gym_aloha/AlohaTransferCube-v0": "aloha"}
+    name = names.get(env)
+    pins = json.loads(Path(__file__).with_name("pins.json").read_text())
+    if name is None or policy != pins["policies"][name]["repo_id"] or revision != pins["policies"][name]["revision"]:
+        raise ValueError("Guide live evaluations require the exact frozen environment and policy revision")
+    if (set(change) != {"change_id", "env", "families", "desc", "seed"}
+            or change["change_id"] != change_id or change["env"] != name
+            or not isinstance(change_id, str) or not re.fullmatch(r"c[0-9]{3,}", change_id)
+            or int(change_id[1:]) < 1 or type(change["seed"]) is not int or change["seed"] < 0):
+        raise ValueError("Guide live change metadata must match the canonical change and environment")
+    families = change["families"]
+    if not isinstance(families, list) or not 1 <= len(families) <= 2:
+        raise ValueError("Guide live changes require one or two trained families")
+    for item in families:
+        if (not isinstance(item, dict) or set(item) != {"family", "params"}
+                or item["family"] not in _PARAMS or not isinstance(item["params"], dict)
+                or set(item["params"]) != set(_PARAMS[item["family"]].split())):
+            raise ValueError("Guide live changes require trained parameter names; use s, b, shift and fraction instead of legacy aliases")
+    count = {"cheap": 3, "expensive": 20}.get(tier)
+    if (count is None or type(episodes) is not int or episodes != count
+            or not isinstance(scenario, dict) or scenario.get("env") != name
+            or scenario.get("scenario_id") != scenario_id
+            or not re.fullmatch(rf"{name}-s(?:0[1-9]|1[0-6])", str(scenario_id))
+            or not isinstance(scenario.get("seeds"), list) or len(scenario["seeds"]) != 50
+            or any(type(value) is not int or value < 0 for value in scenario["seeds"])
+            or len(set(scenario["seeds"])) != 50 or type(seed) is not int or seed != scenario["seeds"][0]):
+        raise ValueError("Guide live tier/scenario must use the frozen canonical IDs and complete fifty-seed prefix")
+    root = os.environ.get("BRIER_DATA", "")
+    if not root or "://" in root or not Path(root).expanduser().is_dir():
+        raise ValueError("Guide live BRIER_DATA must be an existing local directory")
+    directory = Path(root).expanduser().resolve()
+    definitions = [json.loads(line) for line in (directory / "scenarios.jsonl").read_text().splitlines()]
+    selected = [row for row in definitions if row.get("scenario_id") == scenario_id and row.get("env") == name]
+    if selected != [scenario]:
+        raise ValueError("Guide live scenario parameters and seeds differ from the frozen source")
+    output = directory / "episodes" / f"{uuid4()}.parquet"
+    torch.set_num_threads(1)
+    vector, native = envs._load(name)
+    folders: list[Path] = []
+    try:
+        loaded = (vector, native, apply_change(native, change))
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2], text=True).strip()
+        rows = []
+        for index, episode_seed in enumerate(scenario["seeds"][:count]):
+            started = time.perf_counter()
+            row, frames = _guide_episode(loaded, name, scenario, tier, episode_seed, capture_cheap_frame=True)
+            if tier == "cheap" or not row["success"]:
+                relative = Path("public/keyframes") / name / change_id / scenario_id / str(episode_seed) / str(uuid4())
+                target = directory / relative
+                if tier == "expensive":
+                    save_keyframes(frames, target, success=False, tier=tier)
+                else:
+                    if len(frames) != 1 or frames[0].dtype != np.uint8 or frames[0].ndim != 3 or frames[0].shape[-1] != 3:
+                        raise ValueError("Guide live cheap evidence requires one actual final RGB frame")
+                    target.mkdir(parents=True, exist_ok=False)
+                    folders.append(target)
+                    with (target / "frame-final.png").open("xb") as stream:
+                        Image.fromarray(frames[0]).save(stream, format="PNG")
+                if target not in folders:
+                    folders.append(target)
+                row["keyframes_uri"] = relative.as_posix()
+            row.update(env=name, policy_repo=policy, policy_revision=revision, change_id=change_id,
+                       scenario_id=scenario_id, tier=tier, episode_idx=index,
+                       wall_seconds=time.perf_counter() - started, lerobot_version=pins["lerobot_version"],
+                       code_commit=commit, host=socket.gethostname())
+            rows.append(row)
+        storage.write_parquet(rows, output.as_uri())
+    except BaseException:
+        for folder in folders:
+            shutil.rmtree(folder)
+        raise
+    finally:
+        vector.close()
+    return output
 
 
 def run_key(env: str, change: dict | None, scenario: dict, tier: str, policy_cache: dict) -> tuple[list[dict], list[str]]:
