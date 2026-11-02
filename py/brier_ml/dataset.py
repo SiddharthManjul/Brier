@@ -76,7 +76,8 @@ def _compiled_rows(compiled: Path) -> list[dict[str, Any]]:
         options = row["options"]
         if guide:
             bucket = int.from_bytes(hashlib.sha256(change.encode()).digest()[:4], "big") % 10
-            split = "train" if bucket < 6 else "calibration" if bucket < 8 else "test"
+            split = ("calibration" if int(change[1:]) > 160 else
+                     "train" if bucket < 6 else "calibration" if bucket < 8 else "test")
             if (not isinstance(options, list) or len(options) != len(values) or not all(isinstance(v, str) for v in options)
                     or (row["split"] != "ood" and row["split"] != split)
                     or (row["split"] != "train" and options != list(values))):
