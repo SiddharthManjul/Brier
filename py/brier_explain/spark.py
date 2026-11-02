@@ -52,11 +52,12 @@ def _json(value: str | bytes) -> Any:
 
 def _image(path: Path) -> dict[str, Any]:
     with Image.open(path) as image:
-        if image.format != "PNG":
-            raise ValueError("Muse images must be actual PNG files")
+        if image.format not in ("PNG", "JPEG"):
+            raise ValueError("Muse images must be actual PNG or JPEG files")
+        media_type = "image/png" if image.format == "PNG" else "image/jpeg"
         image.verify()
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}}
+    return {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{encoded}"}}
 
 
 def _call(prompt: str, frames: Sequence[Path], schema: dict[str, Any], name: str) -> tuple[str, dict[str, Any]]:
@@ -102,7 +103,7 @@ def _call(prompt: str, frames: Sequence[Path], schema: dict[str, Any], name: str
 
 
 def explain(prompt: str, frames: Sequence[Path]) -> dict[str, Any]:
-    """Send Rust's prompt and sixteen ordered raw/overlay PNGs; return a strict explanation."""
+    """Send Rust's prompt and sixteen ordered raw/overlay images; return a strict explanation."""
     if isinstance(frames, (str, bytes)) or len(frames) != 16:
         raise ValueError("explanation requires eight raw and eight overlay PNGs")
     model, result = _call(prompt, frames, _EXPLANATION, "robot_failure")
