@@ -149,6 +149,83 @@ def test_runner_preserves_pinned_revision_in_loader_and_raw_provenance(
     assert all(json.loads(row["terminal_state"])["checkpoint_revision"] == pinned for row in rows)
 
 
+def _guide_live_arguments(env: str = "pusht") -> tuple[tuple, dict]:
+    pins = json.loads(Path(runner.__file__).with_name("pins.json").read_text())
+    change = {"change_id": "c900", "env": env, "desc": "Live native change", "seed": 900,
+              "families": [{"family": "action_scale", "params": {"s": .9}}]}
+    scenario = {"scenario_id": f"{env}-s01", "env": env, "params": {"pose_bin": 1,
+                "lighting": "normal", "camera_jitter": False, **({"physics_jitter": False} if env == "aloha" else {})},
+                "seeds": list(range(50)), "baseline_success": .8}
+    full = ENV if env == "pusht" else "gym_aloha/AlohaTransferCube-v0"
+    return (full, pins["policies"][env]["repo_id"], 3, 0, "c900", f"{env}-s01", "cheap"), {
+        "change": change, "scenario": scenario, "revision": pins["policies"][env]["revision"]}
+
+
+@pytest.mark.parametrize("fault", ["policy", "seed", "scenario", "legacy_params", "scenario_params"])
+def test_guide_live_rejects_policy_seed_scenario_or_legacy_parameter_drift_before_loading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    monkeypatch.setenv("BRIER_DATA", str(tmp_path))
+    arguments, options = _guide_live_arguments()
+    (tmp_path / "scenarios.jsonl").write_text(json.dumps(options["scenario"]) + "\n")
+    if fault == "policy":
+        options["revision"] = "a" * 40
+    elif fault == "seed":
+        arguments = (*arguments[:3], 1, *arguments[4:])
+    elif fault == "scenario":
+        options["scenario"]["scenario_id"] = "aloha-s01"
+    elif fault == "legacy_params":
+        options["change"]["families"][0]["params"] = {"scale": .9}
+    else:
+        options["scenario"]["params"]["pose_bin"] = 4
+    monkeypatch.setattr(runner.envs, "_load", lambda *_: pytest.fail("invalid live input loaded a native policy"))
+    with pytest.raises(ValueError, match="Guide live"):
+        runner.run_episodes(*arguments, **options)
+    assert not list(tmp_path.rglob("*.parquet"))
+
+
+@pytest.mark.parametrize("environment", ["pusht", "aloha"])
+def test_guide_live_reuses_native_episode_and_persists_actual_cheap_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment: str,
+) -> None:
+    monkeypatch.setenv("BRIER_DATA", str(tmp_path))
+    arguments, options = _guide_live_arguments(environment)
+    (tmp_path / "scenarios.jsonl").write_text(json.dumps(options["scenario"]) + "\n")
+    received, closed = [], []
+    vector = SimpleNamespace(close=lambda: closed.append(True))
+    policy = object()
+    monkeypatch.setattr(runner, "_load", lambda *_: pytest.fail("Guide live path used the legacy policy loader"))
+    monkeypatch.setattr(runner.envs, "_load", lambda name: (received.append(("load", name)) or vector, policy))
+    state = object()
+    monkeypatch.setattr(runner, "apply_change", lambda native, change: state if native is policy and change == options["change"] else None)
+
+    def episode(loaded, env, scenario, tier, seed, *, capture_cheap_frame):
+        assert loaded == (vector, policy, state) and capture_cheap_frame is True
+        assert scenario == options["scenario"] and env == environment and tier == "cheap"
+        received.append(("episode", seed))
+        return {"seed": seed, "success": False, "steps": 10, "max_steps": 150,
+                "reward_sum": .1, "max_reward": .1, "final_reward": .1,
+                "coverage_final": .1 if env == "pusht" else None, "coverage_max": .1 if env == "pusht" else None,
+                "block_disp_px": 1. if env == "pusht" else None,
+                "touched_right": None if env == "pusht" else False, "touched_left": None if env == "pusht" else False,
+                "lifted": None if env == "pusht" else False, "table_contact_steps": None if env == "pusht" else 0,
+                "action_flip_rate": 0., "terminal_state_json": "{}", "keyframes_uri": None}, [np.full((8, 8, 3), seed, np.uint8)]
+
+    monkeypatch.setattr(runner, "_guide_episode", episode)
+    output = runner.run_episodes(*arguments, **options)
+    table = pq.ParquetFile(output).read()
+    assert table.schema == runner.storage._SCHEMA
+    assert received == [("load", environment), ("episode", 0), ("episode", 1), ("episode", 2)]
+    assert closed == [True]
+    for row in table.to_pylist():
+        assert row["change_id"] == "c900" and row["scenario_id"] == f"{environment}-s01"
+        assert row["policy_revision"] == options["revision"]
+        files = list((tmp_path / row["keyframes_uri"]).glob("*.png"))
+        assert len(files) == 1
+        with Image.open(files[0]) as image:
+            assert np.asarray(image).min() == np.asarray(image).max() == row["seed"]
+
+
 @pytest.mark.parametrize("revision", ["main", "a" * 39, "z" * 40, True, 1])
 def test_runner_rejects_unpinned_revisions_before_model_loading(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, revision,
