@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 from collections import deque
 from copy import deepcopy
@@ -95,6 +96,23 @@ def generate_changes(env: str, n: int = 80, n_benign: int = 28, seed: int = 2026
              "families": families, "desc": str(rng.choice(_TITLES[families[0]['family']].split("|"))),
              "seed": int(rng.integers(0, 2**32))} for index, families in enumerate(cards)]
 
+
+
+def extend_changes(env: str, n: int, seed: int, magnitudes: dict, first_id: int) -> list[dict[str, Any]]:
+    """Generate a distribution-preserving held-out extension with globally new IDs."""
+    if n not in {20, 40, 60} or type(first_id) is not int or first_id <= 160:
+        raise ValueError("extension requires 20/40/60 changes and IDs after c160")
+    generated = generate_changes(env, seed=seed, magnitudes=magnitudes)
+    benign = round(.35 * n)
+    doubles = round(.3 * (n - benign))
+    sizes = {0: benign, 1: n - benign - doubles, 2: doubles}
+    cards = [card for size, count in sizes.items() for card in [
+        card for card in generated if (0 if card["families"][0]["family"] == "benign"
+                                      else len(card["families"])) == size][:count]]
+    np.random.default_rng(seed).shuffle(cards)
+    for index, card in enumerate(cards, first_id):
+        card["change_id"] = f"c{index:03d}"
+    return cards
 
 def _validate(policy: Any, change: dict[str, Any], legacy: bool) -> list[tuple[str, dict[str, Any]]]:
     keys = {"description", "families"} if legacy else {"change_id", "env", "families", "desc", "seed"}
@@ -277,11 +295,35 @@ def _main() -> None:
     parser.add_argument("--n", type=int, default=80)
     parser.add_argument("--magnitudes", type=Path)
     parser.add_argument("--write", action="store_true")
+    parser.add_argument("--extend", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=2026)
     args = parser.parse_args()
+    if args.extend:
+        if not args.write or args.extend not in {20, 40, 60} or args.seed < 0:
+            parser.error("--extend requires --write, 20/40/60 changes and a nonnegative seed")
+        args.magnitudes = args.magnitudes or Path(os.environ["BRIER_DATA"]) / "manifests" / f"magnitudes_{args.env}.json"
+        folder = args.magnitudes.parent
+        originals = {env: (folder / f"changes_{env}.jsonl").read_bytes() for env in ("pusht", "aloha")}
+        cards = [json.loads(line) for content in originals.values() for line in content.splitlines()]
+        identifiers = [int(card["change_id"][1:]) for card in cards]
+        if len(set(identifiers)) != len(identifiers) or any(card["env"] not in originals for card in cards):
+            raise ValueError("extension requires globally unique production change IDs")
+        changes = extend_changes(args.env, args.extend, args.seed,
+                                 json.loads(args.magnitudes.read_text()), max(identifiers) + 1)
+        benign, doubles = round(.35 * args.extend), round(.3 * (args.extend - round(.35 * args.extend)))
+        output = folder / f"changes_{args.env}.jsonl"
+        if any((folder / f"changes_{env}.jsonl").read_bytes() != value for env, value in originals.items()):
+            raise ValueError("source manifests changed during extension")
+        with output.open("ab") as stream:
+            stream.write((b"" if originals[args.env].endswith(b"\n") else b"\n")
+                         + "".join(json.dumps(card) + "\n" for card in changes).encode())
+        print(json.dumps({"changes": len(changes), "benign": benign, "two_family": doubles,
+                          "first_new_id": changes[0]["change_id"], "last_new_id": changes[-1]["change_id"]}))
+        return
     if args.write and args.magnitudes is None:
         parser.error("--write requires measured --magnitudes from the pilot")
     magnitudes = json.loads(args.magnitudes.read_text()) if args.magnitudes else None
-    changes = generate_changes(args.env, args.n, round(.35 * args.n), magnitudes=magnitudes)
+    changes = generate_changes(args.env, args.n, round(.35 * args.n), seed=args.seed, magnitudes=magnitudes)
     if args.write:
         output = args.magnitudes.parent / f"changes_{args.env}.jsonl"
         if output.exists():
