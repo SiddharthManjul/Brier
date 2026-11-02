@@ -313,3 +313,64 @@ def test_new_container_preserves_legacy_aloha_ledger_ids_cards_and_pose(dataset_
     assert dataset["ids"][0] == "c101:aloha_transfer_cube-s01:regressed:ev"
     assert dataset["features"][:, FEATURE_NAMES.index("env_is_aloha")].tolist() == [1.] * 15
     assert dataset["features"][:, FEATURE_NAMES.index("pose_bin")].tolist() == [0.] * 15
+
+
+@pytest.fixture
+def heldout_dataset(dataset_files: tuple[Path, Path], tmp_path: Path) -> tuple[Path, Path, dict]:
+    import subprocess
+
+    ledger, _ = _guide_files(dataset_files)
+    binary = Path(__file__).resolve().parents[2] / "target/debug/brier"
+    original = tmp_path / "rust-original.jsonl"
+    subprocess.run([str(binary), "compile", "--ledger", str(ledger), "--out", str(original)],
+                   check=True, capture_output=True, text=True)
+    before = load_dataset(ledger, original)
+    with sqlite3.connect(ledger) as connection:
+        for change, family, params in [
+            ("c161", "action_latency", {"k": 2}), ("c163", "brightness", {"gain": .8, "contrast": 1.}),
+            ("c162", "occlusion", {"fraction": .2}), ("c164", "chunk_len", {"n_action_steps": 4}),
+        ]:
+            card = {"change_id": change, "env": "pusht", "families": [{"family": family, "params": params}],
+                    "desc": "Held-out extension", "seed": 2027}
+            connection.execute("INSERT INTO changes VALUES (?, ?, ?)",
+                               (change, "gym_pusht/PushT-v0", json.dumps(card)))
+            connection.execute("INSERT INTO labels VALUES (?, 'pusht-s01', 1, 'stall/timeout', 2)", (change,))
+            connection.execute("INSERT INTO runs VALUES (?, 'pusht-s01', 'cheap', 3, 1, 0.2)", (change,))
+    extended = tmp_path / "rust-heldout.jsonl"
+    subprocess.run([str(binary), "compile", "--ledger", str(ledger), "--heldout-from", "c161", "--out", str(extended)],
+                   check=True, capture_output=True, text=True)
+    return ledger, extended, before
+
+
+def test_rust_heldout_assignments_load_without_changing_original_features(heldout_dataset) -> None:
+    ledger, compiled, before = heldout_dataset
+    source, ledger_bytes = compiled.read_bytes(), ledger.read_bytes()
+    after = load_dataset(ledger, compiled)
+    rows = [json.loads(line) for line in compiled.read_text().splitlines()]
+    for change, split in [("c161", "calibration"), ("c163", "calibration"), ("c162", "ood"), ("c164", "ood")]:
+        assert {row["split"] for row in rows if row["change_id"] == change} == {split}
+        assert after["splits"][after["changes"].index(change)] == split
+    assert int.from_bytes(hashlib.sha256(b"c161").digest()[:4], "big") % 10 < 6
+    assert int.from_bytes(hashlib.sha256(b"c163").digest()[:4], "big") % 10 >= 8
+    for i, identity in enumerate(before["ids"]):
+        j = after["ids"].index(identity)
+        assert after["splits"][j] == before["splits"][i]
+        np.testing.assert_array_equal(after["features"][j], before["features"][i])
+    assert {change for change, split in zip(after["changes"], after["splits"], strict=True) if split == "train"} == {
+        change for change, split in zip(before["changes"], before["splits"], strict=True) if split == "train"}
+    assert compiled.read_bytes() == source and ledger.read_bytes() == ledger_bytes
+
+
+@pytest.mark.parametrize("change,split", [("c161", "train"), ("c163", "test"), ("c161", "ood"),
+                                          ("c162", "calibration"), ("c164", "calibration"), ("c101", "calibration")])
+def test_rust_heldout_loader_preserves_old_hash_and_ood_guards(heldout_dataset, change: str, split: str) -> None:
+    ledger, compiled, _ = heldout_dataset
+    rows = [json.loads(line) for line in compiled.read_text().splitlines()]
+    original = {row["split"] for row in rows if row["change_id"] == change}
+    assert original != {split}
+    for row in rows:
+        if row["change_id"] == change:
+            row["split"] = split
+    compiled.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    with pytest.raises(ValueError, match="options/split|held out as ood"):
+        load_dataset(ledger, compiled)
