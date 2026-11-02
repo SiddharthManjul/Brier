@@ -751,6 +751,248 @@ fn staged_guide_parquet_uses_authoritative_guide_labels_and_preserves_frozen_row
     }
 }
 
+fn guide3_direct_fixture(noev: f64, run_all: bool, explore: bool) -> (Fixture, PathBuf, Value) {
+    let f = guide_fixture("pusht", 40, 12);
+    let original = read_jsonl(&f.directory.join("episodes.jsonl"));
+    let mut stored = original.clone();
+    for row in &mut stored {
+        if row["change_id"] != "base" {
+            row["change_id"] = json!("c004");
+        }
+    }
+    let mut cards = read_jsonl(&f.directory.join("changes.jsonl"));
+    let live = cards[0].clone();
+    cards[0]["change_id"] = json!("c004");
+    write_jsonl(&f.directory.join("changes.jsonl"), &cards);
+    write_jsonl(&f.directory.join("episodes.jsonl"), &stored);
+    assert!(guide_command(&f).status.success());
+    let mut scenario = read_jsonl(&f.directory.join("scenarios.jsonl"))[0].clone();
+    scenario["env"] = json!("gym_pusht/PushT-v0");
+    fs::write(f.directory.join("catalog.json"),json!({"changes":[{"change_id":"c002","env":"gym_pusht/PushT-v0","card":live}],"scenarios":[scenario]}).to_string()).unwrap();
+    let connection = Connection::open(&f.ledger).unwrap();
+    connection
+        .execute(
+            "INSERT INTO changes VALUES('c002','gym_pusht/PushT-v0',?1,'now')",
+            [live.to_string()],
+        )
+        .unwrap();
+    let directory = f.directory.join("direct-expensive");
+    fs::create_dir(&directory).unwrap();
+    write_guide_parquet(
+        &directory.join("episodes.parquet"),
+        &original
+            .into_iter()
+            .filter(|r| r["tier"] == "expensive")
+            .collect::<Vec<_>>(),
+    );
+    let model = format!("model@{}+lora@{}", "a".repeat(40), "b".repeat(64));
+    let decision = json!({"decision_id":Uuid::new_v4().to_string(),"tier_used":"T2-noev","model_version":model,"lambda":if run_all{0.0}else{0.8},"action":"expensive","propensity":if explore{0.05}else{1.0},"reason":if explore{"exploration"}else{"policy_above_lambda"},"probabilities":{
+        "regressed":{"yes":noev,"no":1.0-noev},"failure_mode":{"none":1.0,"collision":0.0,"oscillation":0.0,"grasp or drop failure":0.0,"overshoot/misalignment":0.0,"stall/timeout":0.0},"success_bucket":{"1":1.0,"2":0.0,"3":0.0,"4":0.0,"5":0.0},"noev_probability":noev,"selection_basis":if run_all{"run_all_uncertifiable"}else if noev>=0.90{"confident_high"}else{"confident_low"},
+        "policy":{"alpha":0.05,"lambda":if run_all{0.0}else{0.8},"calibration_changes":30,"guarantee":"change","certified":!run_all,"run_all":run_all,"risk_bound":if run_all{1.0}else{1.0/31.0},"guarantee_metric":"unconditional_change_miss"},
+        "calibration":{"model_version":model,"t1_model_version":format!("t1@{}","c".repeat(64)),"risk_change_ids":(101..=130).map(|i|format!("c{i:03}")).collect::<Vec<_>>()}}});
+    (f, directory, decision)
+}
+
+fn insert_guide3_decision(f: &Fixture, decision: &Value) {
+    Connection::open(&f.ledger)
+        .unwrap()
+        .execute(
+            "INSERT INTO decisions VALUES(?1,'c002','pusht-s01',?2,?3,?4,?5,?6,?7,?8,'now')",
+            rusqlite::params![
+                decision["decision_id"].as_str().unwrap(),
+                decision["tier_used"].as_str().unwrap(),
+                decision["model_version"].as_str().unwrap(),
+                decision["probabilities"].to_string(),
+                decision["lambda"].as_f64().unwrap(),
+                decision["action"].as_str().unwrap(),
+                decision["propensity"].as_f64().unwrap(),
+                decision["reason"].as_str().unwrap()
+            ],
+        )
+        .unwrap();
+}
+
+#[test]
+fn guide3_direct_native_import_accepts_only_logged_high_low_exploration_or_safe_run_all() {
+    for (noev, run_all, explore, scenario) in [
+        (0.95, false, false, false),
+        (0.01, false, true, false),
+        (0.01, true, false, false),
+        (0.95, false, false, true),
+    ] {
+        let (f, directory, mut decision) = guide3_direct_fixture(noev, run_all, explore);
+        if scenario {
+            decision["probabilities"]["policy"]["guarantee"] = json!("scenario");
+            decision["probabilities"]["policy"]["guarantee_metric"] = json!("mean_scenario_miss");
+        }
+        insert_guide3_decision(&f, &decision);
+        let connection = Connection::open(&f.ledger).unwrap();
+        let before:Vec<String>=connection.prepare("SELECT json_array(run_id,change_id,scenario_id,tier,episodes,successes,mean_reward,uri,wall_seconds) FROM runs ORDER BY run_id").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        let output = command_at(&f, &directory);
+        assert!(output.status.success(), "{:?}", output);
+        let cheap: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM runs WHERE change_id='c002' AND tier='cheap'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cheap, 0);
+        assert_eq!(counts(&f), (4, 2));
+        let label:(i64,String,i64,String)=connection.query_row("SELECT regressed,failure_mode,success_bucket,cause_family FROM labels WHERE change_id='c002'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(
+            label,
+            (1, "stall/timeout".into(), 4, "action_latency".into())
+        );
+        let after:Vec<String>=connection.prepare("SELECT json_array(run_id,change_id,scenario_id,tier,episodes,successes,mean_reward,uri,wall_seconds) FROM runs WHERE change_id!='c002' ORDER BY run_id").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(before, after);
+        let bytes = fs::read(&f.ledger).unwrap();
+        assert!(!command_at(&f, &directory).status.success());
+        assert_eq!(bytes, fs::read(&f.ledger).unwrap());
+    }
+}
+
+#[test]
+fn guide3_direct_native_import_rejects_unproven_decisions_without_mutating_the_ledger() {
+    for fault in [
+        "missing",
+        "duplicate",
+        "skip",
+        "legacy-tier",
+        "t3",
+        "uncertain",
+        "different-noev",
+        "probability",
+        "mode-keys",
+        "model",
+        "model-unpinned",
+        "lambda",
+        "propensity",
+        "metric",
+        "certificate",
+        "fallback",
+        "pool-size",
+        "pool-duplicate",
+        "pool-live",
+        "basis",
+        "decision-id",
+    ] {
+        let (f, directory, mut decision) = guide3_direct_fixture(0.95, false, false);
+        match fault {
+            "skip" => decision["action"] = json!("skip"),
+            "legacy-tier" => decision["tier_used"] = json!("T2"),
+            "t3" => decision["reason"] = json!("t3_added"),
+            "uncertain" => {
+                decision["probabilities"]["regressed"] = json!({"yes":0.5,"no":0.5});
+                decision["probabilities"]["noev_probability"] = json!(0.5);
+            }
+            "different-noev" => decision["probabilities"]["noev_probability"] = json!(0.91),
+            "probability" => decision["probabilities"]["regressed"]["no"] = json!(0.4),
+            "mode-keys" => {
+                decision["probabilities"]["failure_mode"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("collision");
+            }
+            "model" => decision["probabilities"]["calibration"]["model_version"] = json!("wrong"),
+            "model-unpinned" => decision["model_version"] = json!("model@main"),
+            "lambda" => decision["lambda"] = json!(0.7),
+            "propensity" => decision["propensity"] = json!(0.05),
+            "metric" => {
+                decision["probabilities"]["policy"]["guarantee_metric"] = json!("conditional_miss")
+            }
+            "certificate" => decision["probabilities"]["policy"]["risk_bound"] = json!(0.1),
+            "fallback" => decision["probabilities"]["policy"]["run_all"] = json!(true),
+            "pool-size" => decision["probabilities"]["policy"]["calibration_changes"] = json!(31),
+            "pool-duplicate" => {
+                decision["probabilities"]["calibration"]["risk_change_ids"][1] = json!("c101")
+            }
+            "pool-live" => {
+                decision["probabilities"]["calibration"]["risk_change_ids"][0] = json!("c002")
+            }
+            "basis" => decision["probabilities"]["selection_basis"] = json!("ev_threshold"),
+            "decision-id" => {
+                decision["decision_id"] =
+                    json!(Uuid::new_v5(&Uuid::NAMESPACE_URL, b"bad").to_string())
+            }
+            _ => {}
+        }
+        if fault != "missing" {
+            insert_guide3_decision(&f, &decision);
+        }
+        if fault == "duplicate" {
+            decision["decision_id"] = json!(Uuid::new_v4().to_string());
+            insert_guide3_decision(&f, &decision);
+        }
+        let before = fs::read(&f.ledger).unwrap();
+        let result = command_at(&f, &directory);
+        assert!(!result.status.success(), "{fault}: {:?}", result);
+        assert_eq!(before, fs::read(&f.ledger).unwrap(), "{fault}");
+    }
+}
+
+#[test]
+fn guide3_direct_decision_never_bypasses_invalid_existing_cheap_or_legacy_episodes() {
+    for fault in [
+        "partial-cheap",
+        "invalid-cheap",
+        "duplicate-cheap",
+        "legacy",
+        "partial-expensive",
+    ] {
+        let (f, directory, decision) = guide3_direct_fixture(0.95, false, false);
+        insert_guide3_decision(&f, &decision);
+        if fault.ends_with("cheap") {
+            for _ in 0..if fault == "duplicate-cheap" { 2 } else { 1 } {
+                Connection::open(&f.ledger)
+                .unwrap()
+                .execute(
+                    "INSERT INTO runs VALUES(?1,'c002','pusht-s01','cheap',?2,?3,1.0,'bad',1.0)",
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        if fault == "partial-cheap" { 2 } else { 3 },
+                        if fault == "invalid-cheap" { 4 } else { 1 }
+                    ],
+                )
+                .unwrap();
+            }
+        } else if fault == "legacy" {
+            write_episodes(
+                &directory.join("episodes.parquet"),
+                "expensive",
+                20,
+                12,
+                true,
+            );
+            let catalog = f.directory.join("catalog.json");
+            let mut value: Value = serde_json::from_slice(&fs::read(&catalog).unwrap()).unwrap();
+            value["scenarios"][0]["seeds"] = json!((0..50).collect::<Vec<_>>());
+            fs::write(catalog, value.to_string()).unwrap();
+        } else {
+            let mut rows: Vec<_> = read_jsonl(&f.directory.join("episodes.jsonl"))
+                .into_iter()
+                .filter(|r| r["tier"] == "expensive")
+                .collect();
+            for row in &mut rows {
+                row["change_id"] = json!("c002");
+            }
+            rows.pop();
+            write_guide_parquet(&directory.join("episodes.parquet"), &rows);
+        }
+        let before = fs::read(&f.ledger).unwrap();
+        let result = command_at(&f, &directory);
+        assert!(!result.status.success(), "{fault}: {:?}", result);
+        if fault == "legacy" {
+            assert!(
+                String::from_utf8_lossy(&result.stderr).contains("three-episode cheap run"),
+                "{:?}",
+                result
+            );
+        }
+        assert_eq!(before, fs::read(&f.ledger).unwrap(), "{fault}");
+    }
+}
+
 #[test]
 fn label_guide_rules_match_every_measured_branch_and_boundary_fixture() {
     let cases: Vec<Value> =
