@@ -10,6 +10,7 @@ on:
       - py/brier_explain/**
   workflow_dispatch:
     inputs:
+      full: {description: Run every selected scenario without early stop, type: boolean, default: false}
       base_ref:
         description: Git commit or ref containing the deployed policy snapshot
         type: string
@@ -100,6 +101,7 @@ jobs:
     if: needs.card.outputs.t0_identical != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    outputs: {snapshot: state-0, wave1: '${{ steps.plan.outputs.wave1 }}', wave2: '${{ steps.plan.outputs.wave2 }}', wave3: '${{ steps.plan.outputs.wave3 }}', wave4: '${{ steps.plan.outputs.wave4 }}'}
     permissions:
       contents: read
       id-token: write
@@ -113,7 +115,8 @@ jobs:
       PYOPENGL_PLATFORM: egl
       HF_HUB_DISABLE_XET: '1'
     steps:
-      - uses: actions/checkout@v4
+      - &checkout
+        uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: robot-ci-input
@@ -141,15 +144,19 @@ jobs:
         run: |
           echo '::error::Configure GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_SERVICE_ACCOUNT before running Robot CI'
           exit 1
-      - uses: actions/setup-python@v5
+      - &python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - uses: google-github-actions/auth@v2
+      - &auth
+        uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
-      - uses: google-github-actions/setup-gcloud@v2
-      - name: Install CPU simulation dependencies
+      - &gcloud
+        uses: google-github-actions/setup-gcloud@v2
+      - &install
+        name: Install CPU simulation dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libgl1 libgles2 libopengl0
@@ -219,27 +226,37 @@ jobs:
                   or len(set(fit + held)) != 26):
               raise SystemExit("Decision bundle must preserve the independent seven-fit/nineteen-risk partition")
           compiled = _compiled_rows(root / "compiled.jsonl")
+          original = [line for line in (root / "compiled.jsonl").read_bytes().splitlines(keepends=True) if int(json.loads(line)["change_id"][1:]) <= 160]
+          if hashlib.sha256(b"".join(original)).hexdigest() != manifest.get("release_hashes", {}).get("compiled.jsonl"):
+              raise SystemExit("Original compiled rows must remain byte-identical to the training-bound frozen release")
+          if any(int(row["change"][1:]) > 160 and row["split"] not in ("calibration", "ood") for row in compiled):
+              raise SystemExit("New changes must remain held out of training and test selection")
           expected_fit, expected_held = calibration_partition(row["change"] for row in compiled
-                                                              if row["split"] == "calibration")
+                                                              if row["split"] == "calibration" and int(row["change"][1:]) <= 160)
           training = sorted({row["change"] for row in compiled if row["split"] == "train"})
           if (fit != expected_fit or held != expected_held
                   or risk.get("t1", {}).get("calibration_change_ids") != fit
                   or risk.get("t1", {}).get("training_change_ids") != training):
               raise SystemExit("Decision bundle fitting pools differ from the frozen compiled changes")
-          if (risk.get("model_version") != manifest.get("model_version")
+          pool = sorted({row["change"] for row in compiled if row["split"] in ("calibration", "test")} - set(fit))
+          if (risk.get("format_version") != 2 or sorted(change["change_id"] for change in risk.get("executed_changes", [])) != pool
+                  or risk.get("model_version") != manifest.get("model_version")
                   or not re.fullmatch(r"[^\s@]+@[0-9a-f]{40}\+lora@[0-9a-f]{64}", str(manifest.get("model_version")))
                   or risk.get("t1") != json.loads((root / "t1.json").read_text())
                   or sorted(risk.get("probability_calibration_change_ids", [])) != sorted(fit)
-                  or sorted(change["change_id"] for change in risk.get("changes", [])) != sorted(held)):
+                  or sorted(change["change_id"] for change in risk.get("changes", [])) != pool):
               raise SystemExit("Decision bundle model and calibration provenance disagree")
           PY
       - name: Validate baseline identity and run the cheap tier
+        id: plan
         run: |
           python - <<'PY'
           import json
           import os
           from pathlib import Path
           import subprocess
+          import sqlite3
+          import shutil
           from brier_sim.runner import run_episodes
 
           root = Path(os.environ["BRIER_DATA"])
@@ -260,53 +277,144 @@ jobs:
           catalog = {"changes": [{"change_id": card["change_id"], "env": card["env"], "card": change}],
                      "scenarios": [{**scenario, "env": card["env"]} for scenario in definitions]}
           (root / "current-catalog.json").write_text(json.dumps(catalog) + "\n")
+          with sqlite3.connect(root / "ledger.sqlite") as connection:
+              connection.execute("INSERT INTO changes VALUES(?,?,?,datetime('now'))", (card["change_id"], card["env"], json.dumps(change)))
+          command = [binary, "decide", "--ledger", str(root / "ledger.sqlite"), "--compiled", str(root / "compiled.jsonl"), "--calibration", str(root / "risk-calibration.json"), "--change", card["change_id"]]
+          plan = json.loads(subprocess.check_output(command, text=True))
           cheap = root / "cheap"
           cheap.mkdir()
           for scenario in definitions:
+              if scenario["scenario_id"] not in plan["cheap_required"]:
+                  continue
               path = run_episodes(card["env"], card["policy"]["id"], 3, scenario["seeds"][0],
                   card["change_id"], scenario["scenario_id"], "cheap", change=change, scenario=scenario,
                   revision=card["policy"]["revision"])
               path.rename(cheap / f"{scenario['scenario_id']}.parquet")
-          subprocess.run([binary, "label", "--ledger", str(root / "ledger.sqlite"),
-              "--episodes", str(cheap), "--catalog", str(root / "current-catalog.json")], check=True)
-          with (root / "decisions.json").open("w") as target:
-              subprocess.run([binary, "decide", "--ledger", str(root / "ledger.sqlite"),
-                  "--compiled", str(root / "compiled.jsonl"), "--calibration", str(root / "risk-calibration.json"),
-                  "--change", card["change_id"]], stdout=target, check=True)
+          if plan["cheap_required"]:
+              subprocess.run([binary, "label", "--ledger", str(root / "ledger.sqlite"), "--episodes", str(cheap), "--catalog", str(root / "current-catalog.json")], check=True)
+              plan = json.loads(subprocess.check_output(command, text=True))
+          if plan["cheap_required"] or len(plan["decisions"]) != len(definitions):
+              raise SystemExit("Incomplete adaptive cheap/scoring stage")
+          (root / "decisions.json").write_text(json.dumps(plan) + "\n")
+          selected = [row["scenario_id"] for row in plan["decisions"] if row["action"] == "expensive"]
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as target:
+              for wave in range(4):
+                  target.write(f"wave{wave + 1}={json.dumps(selected[4*wave:4*wave+4] or ['none'])}\n")
+          shutil.copytree(inputs, root / "brier-ci")
+          shutil.copyfile(Path(os.environ["RUNNER_TEMP"]) / "brier-cloud-source.txt", root / "brier-cloud-source.txt")
           PY
-      - name: Run and label selected expensive evaluations
+      - uses: actions/upload-artifact@v4
+        with: {name: state-0, path: '${{ runner.temp }}/brier-data', if-no-files-found: error}
+
+  wave1:
+    needs: evaluate
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'skipped') && (inputs.full || !contains(needs.*.outputs.block, 'true')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy: {fail-fast: false, max-parallel: 4, matrix: {scenario: '${{ fromJSON(needs.evaluate.outputs.wave1) }}'}}
+    env: &wave-env {BRIER_DATA: '${{ runner.temp }}/brier-data', MUJOCO_GL: egl, PYOPENGL_PLATFORM: egl, HF_HUB_DISABLE_XET: '1',
+      WAVE: "${{ (github.job == 'wave1' || github.job == 'check1') && '1' || (github.job == 'wave2' || github.job == 'check2') && '2' || (github.job == 'wave3' || github.job == 'check3') && '3' || '4' }}"}
+    steps: &wave-steps
+      - *checkout
+      - *python
+      - *install
+      - uses: actions/download-artifact@v4
+        with: {name: "${{ join(needs.*.outputs.snapshot, '') }}", path: '${{ env.BRIER_DATA }}'}
+      - name: Run one selected expensive scenario
+        env: {SCENARIO: '${{ matrix.scenario }}'}
         run: |
           python - <<'PY'
-          import json
-          import os
+          import json, os
           from pathlib import Path
-          import subprocess
           from brier_sim.runner import run_episodes
-
+          if os.environ["SCENARIO"] == "none": raise SystemExit(0)
           root = Path(os.environ["BRIER_DATA"])
-          inputs = Path(os.environ["RUNNER_TEMP"]) / "brier-ci"
-          card = json.loads((inputs / "card.json").read_text())
-          decisions = json.loads((root / "decisions.json").read_text())["decisions"]
-          env = {"gym_pusht/PushT-v0": "pusht", "gym_aloha/AlohaTransferCube-v0": "aloha"}[card["env"]]
-          definitions = {scenario["scenario_id"]: scenario for scenario in
-                         (json.loads(line) for line in (root / "scenarios.jsonl").read_text().splitlines()) if scenario["env"] == env}
+          card = json.loads((root / "brier-ci/card.json").read_text())
+          scenario = next(row for row in map(json.loads, (root / "scenarios.jsonl").read_text().splitlines()) if row["scenario_id"] == os.environ["SCENARIO"])
+          decision = next(row for row in json.loads((root / "decisions.json").read_text())["decisions"] if row["scenario_id"] == scenario["scenario_id"])
+          if decision["action"] != "expensive": raise SystemExit("Scenario was not selected")
           change = json.loads((root / "current-catalog.json").read_text())["changes"][0]["card"]
-          expensive = root / "expensive"
-          expensive.mkdir()
-          for decision in decisions:
-              if decision["action"] == "skip":
-                  continue
-              if decision["action"] != "expensive":
-                  raise SystemExit(f"Unsupported requested action: {decision['action']}")
-              scenario = definitions[decision["scenario_id"]]
-              path = run_episodes(card["env"], card["policy"]["id"], 20, scenario["seeds"][0],
-                  card["change_id"], scenario["scenario_id"], "expensive", change=change, scenario=scenario,
-                  revision=card["policy"]["revision"])
-              path.rename(expensive / f"{scenario['scenario_id']}.parquet")
-          if any(decision["action"] == "expensive" for decision in decisions):
-              subprocess.run([str(inputs / "brier"), "label", "--ledger", str(root / "ledger.sqlite"),
-                  "--episodes", str(expensive), "--catalog", str(root / "current-catalog.json")], check=True)
+          path = run_episodes(card["env"], card["policy"]["id"], 20, scenario["seeds"][0], card["change_id"], scenario["scenario_id"], "expensive", change=change, scenario=scenario, revision=card["policy"]["revision"])
+          (root / "expensive" / f"wave-{os.environ['WAVE']}").mkdir(parents=True)
+          path.rename(root / "expensive" / f"wave-{os.environ['WAVE']}" / f"{scenario['scenario_id']}.parquet")
           PY
+      - uses: actions/upload-artifact@v4
+        if: matrix.scenario != 'none'
+        with: {name: 'wave-${{ env.WAVE }}-${{ matrix.scenario }}', path: '${{ env.BRIER_DATA }}/expensive/wave-${{ env.WAVE }}', if-no-files-found: error}
+      - uses: actions/upload-artifact@v4
+        if: matrix.scenario != 'none'
+        with: {name: 'frames-${{ env.WAVE }}-${{ matrix.scenario }}', path: '${{ env.BRIER_DATA }}/public', if-no-files-found: ignore}
+
+  check1:
+    needs: [evaluate, wave1]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && join(needs.*.outputs.snapshot, '') != '' }}
+    runs-on: ubuntu-latest
+    outputs: {snapshot: '${{ steps.check.outputs.snapshot }}', block: '${{ steps.check.outputs.block }}', wave2: '${{ needs.evaluate.outputs.wave2 }}', wave3: '${{ needs.evaluate.outputs.wave3 }}', wave4: '${{ needs.evaluate.outputs.wave4 }}'}
+    env: *wave-env
+    steps: &check-steps
+      - uses: actions/download-artifact@v4
+        with: {name: "${{ join(needs.*.outputs.snapshot, '') }}", path: '${{ env.BRIER_DATA }}'}
+      - uses: actions/download-artifact@v4
+        with: {pattern: 'wave-${{ env.WAVE }}-*', path: '${{ env.BRIER_DATA }}/expensive/wave-${{ env.WAVE }}', merge-multiple: true}
+      - uses: actions/download-artifact@v4
+        with: {pattern: 'frames-${{ env.WAVE }}-*', path: '${{ env.BRIER_DATA }}/public', merge-multiple: true}
+      - name: Label the complete wave and check for BLOCK
+        id: check
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          root = Path(os.environ["BRIER_DATA"])
+          binary = root / "brier-ci/brier"; binary.chmod(0o755)
+          card = json.loads((root / "brier-ci/card.json").read_text())
+          wave = root / "expensive" / f"wave-{os.environ['WAVE']}"
+          if wave.is_dir() and list(wave.glob("*.parquet")):
+              subprocess.run([str(binary), "label", "--ledger", str(root / "ledger.sqlite"), "--episodes", str(wave), "--catalog", str(root / "current-catalog.json")], check=True)
+          result = subprocess.run([str(binary), "report", "--ledger", str(root / "ledger.sqlite"), "--change", card["change_id"], "--out", str(root / "wave-report.md")], capture_output=True, text=True)
+          if result.returncode not in (0, 1): raise SystemExit(result.stderr)
+          verdict = json.loads(result.stdout)["verdict"]
+          level = json.loads((root / "decisions.json").read_text())["decisions"][0]["probabilities"]["policy"].get("guarantee")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as target:
+              target.write(f"snapshot=state-{os.environ['WAVE']}\nblock={str(verdict == 'block' and level == 'change').lower()}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with: {name: 'state-${{ env.WAVE }}', path: '${{ env.BRIER_DATA }}', if-no-files-found: error}
+
+  wave2: {needs: check1, if: "${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'skipped') && (inputs.full || !contains(needs.*.outputs.block, 'true')) }}", runs-on: ubuntu-latest, timeout-minutes: 360,
+    strategy: {fail-fast: false, max-parallel: 4, matrix: {scenario: '${{ fromJSON(needs.check1.outputs.wave2) }}'}}, env: *wave-env, steps: *wave-steps}
+  check2: {needs: [check1, wave2], if: "${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && join(needs.*.outputs.snapshot, '') != '' }}", runs-on: ubuntu-latest, env: *wave-env,
+    steps: *check-steps, outputs: {snapshot: '${{ steps.check.outputs.snapshot }}', block: '${{ steps.check.outputs.block }}', wave3: '${{ needs.check1.outputs.wave3 }}', wave4: '${{ needs.check1.outputs.wave4 }}'}}
+  wave3: {needs: check2, if: "${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'skipped') && (inputs.full || !contains(needs.*.outputs.block, 'true')) }}", runs-on: ubuntu-latest, timeout-minutes: 360,
+    strategy: {fail-fast: false, max-parallel: 4, matrix: {scenario: '${{ fromJSON(needs.check2.outputs.wave3) }}'}}, env: *wave-env, steps: *wave-steps}
+  check3: {needs: [check2, wave3], if: "${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && join(needs.*.outputs.snapshot, '') != '' }}", runs-on: ubuntu-latest, env: *wave-env,
+    steps: *check-steps, outputs: {snapshot: '${{ steps.check.outputs.snapshot }}', block: '${{ steps.check.outputs.block }}', wave4: '${{ needs.check2.outputs.wave4 }}'}}
+  wave4: {needs: check3, if: "${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'skipped') && (inputs.full || !contains(needs.*.outputs.block, 'true')) }}", runs-on: ubuntu-latest, timeout-minutes: 360,
+    strategy: {fail-fast: false, max-parallel: 4, matrix: {scenario: '${{ fromJSON(needs.check3.outputs.wave4) }}'}}, env: *wave-env, steps: *wave-steps}
+  check4: {needs: [check3, wave4], if: "${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && join(needs.*.outputs.snapshot, '') != '' }}", runs-on: ubuntu-latest, env: *wave-env,
+    steps: *check-steps, outputs: {snapshot: '${{ steps.check.outputs.snapshot }}', block: '${{ steps.check.outputs.block }}'}}
+
+  finish:
+    needs: check4
+    if: needs.check4.result == 'success'
+    runs-on: ubuntu-latest
+    permissions: {contents: read, id-token: write}
+    env:
+      BRIER_DATA: ${{ runner.temp }}/brier-data
+      MUJOCO_GL: egl
+      PYOPENGL_PLATFORM: egl
+      HF_HUB_DISABLE_XET: '1'
+      META_API_KEY: ${{ secrets.META_API_KEY }}
+      BRIER_INGEST_TOKEN: ${{ secrets.BRIER_INGEST_TOKEN }}
+      BRIER_INGEST_URL: ${{ vars.BRIER_INGEST_URL }}
+    steps:
+      - *checkout
+      - *python
+      - *auth
+      - *gcloud
+      - *install
+      - uses: actions/download-artifact@v4
+        with: {name: '${{ needs.check4.outputs.snapshot }}', path: '${{ env.BRIER_DATA }}'}
+      - run: chmod +x "$BRIER_DATA/brier-ci/brier"
       - name: Explain every failed expensive episode
         run: |
           python - <<'PY'
@@ -317,7 +425,7 @@ jobs:
           import subprocess
 
           root = Path(os.environ["BRIER_DATA"])
-          inputs = Path(os.environ["RUNNER_TEMP"]) / "brier-ci"
+          inputs = root / "brier-ci"
           card = json.loads((inputs / "card.json").read_text())
           with sqlite3.connect(root / "ledger.sqlite") as connection:
               runs = connection.execute("SELECT run_id FROM runs WHERE change_id=? AND tier='expensive' AND episodes=20 AND successes<episodes ORDER BY scenario_id", (card["change_id"],)).fetchall()
@@ -336,7 +444,7 @@ jobs:
           import subprocess
 
           root = Path(os.environ["BRIER_DATA"])
-          source = (Path(os.environ["RUNNER_TEMP"]) / "brier-cloud-source.txt").read_text()
+          source = (root / "brier-cloud-source.txt").read_text()
           if (root / "public").is_dir():
               subprocess.run(["gcloud", "storage", "cp", "--recursive", str(root / "public"), source + "/"], check=True)
           (root / "published.json").write_text(json.dumps({"storage": source}) + "\n")
@@ -351,7 +459,7 @@ jobs:
           import subprocess
 
           root = Path(os.environ["BRIER_DATA"])
-          inputs = Path(os.environ["RUNNER_TEMP"]) / "brier-ci"
+          inputs = root / "brier-ci"
           if not (root / "decisions.json").is_file():
               raise SystemExit("No complete decision stage exists; Robot CI cannot report a pass")
           card = json.loads((inputs / "card.json").read_text())
