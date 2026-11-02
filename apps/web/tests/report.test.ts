@@ -46,3 +46,45 @@ test("combined-only reports cannot masquerade as measured test calibration", () 
   assert.deepEqual(strategy.reliability, []);
   assert.throws(() => readStrategies({ strategies: { invalid: { test_metrics: false } } }), /object/);
 });
+
+test("readStrategies rejects malformed values for every dashboard metric before rendering", () => {
+  for (const field of ["eval_hours_saved", "missed_regression_fraction", "change_recall",
+    "p50_latency_seconds", "p95_latency_seconds", "cost_usd_per_change"]) {
+    for (const value of ["pending", false, [], {}, NaN, Infinity]) {
+      assert.throws(() => readStrategies({ strategies: { measured: { [field]: value } } }),
+        `${field} must reject ${String(value)}`);
+    }
+  }
+  for (const [field, value] of [
+    ["eval_hours_saved", 1.01], ["missed_regression_fraction", -0.01],
+    ["missed_regression_fraction", 1.01], ["change_recall", -0.01], ["change_recall", 1.01],
+    ["p50_latency_seconds", -0.01], ["p95_latency_seconds", -0.01], ["cost_usd_per_change", -0.01],
+  ] as const) {
+    assert.throws(() => readStrategies({ strategies: { measured: { [field]: value } } }),
+      `${field} must reject out-of-range ${value}`);
+  }
+  for (const [field, value] of [["ece", -0.01], ["ece", 1.01], ["brier", -0.01],
+    ["brier", 1.01], ["auroc", -0.01], ["auroc", 1.01], ["nll", -0.01]] as const) {
+    assert.throws(() => readStrategies({ strategies: { measured: { test_metrics: { [field]: value } } } }));
+  }
+  assert.throws(() => readStrategies({ strategies: { measured: { ood_metrics: { ece: 1.01 } } } }));
+});
+
+test("readStrategies preserves nullable measurements and legitimate cost overruns", () => {
+  const [strategy] = readStrategies({ strategies: { measured: {
+    eval_hours_saved: -0.2, missed_regression_fraction: null, change_recall: null,
+    p50_latency_seconds: 0, p95_latency_seconds: 400, cost_usd_per_change: 120,
+    test_metrics: { ece: 0, brier: 1, nll: 40, auroc: null }, ood_metrics: { ece: null },
+    threshold_curve: [{ eval_hours_saved: -0.2, missed_regression_fraction: 0.05 }],
+  } } });
+  assert.equal(strategy.metrics.eval_hours_saved, -0.2);
+  assert.equal(strategy.metrics.missed_regression_fraction, null);
+  assert.equal(strategy.metrics.change_recall, null);
+  assert.equal(strategy.metrics.p50_latency_seconds, 0);
+  assert.equal(strategy.metrics.p95_latency_seconds, 400);
+  assert.equal(strategy.metrics.cost_usd_per_change, 120);
+  assert.equal(strategy.metrics.nll, 40);
+  assert.equal(strategy.metrics.auroc, null);
+  assert.equal(strategy.oodEce, null);
+  assert.deepEqual(strategy.curve, [{ saved: -20, missed: 5 }]);
+});
