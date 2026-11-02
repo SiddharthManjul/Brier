@@ -566,3 +566,60 @@ fn legacy_aloha_ledger_ids_compile_and_load_without_renaming() {
         assert_eq!(question["prompt"], expected["prompt"]);
     }
 }
+
+#[test]
+fn guide_explanations_render_only_measured_native_fields() {
+    let scenario = json!({"pose_bin":1,"lighting":"normal","camera_jitter":false});
+    let mut telemetry = json!({"steps":300,"max_steps":300,"reward_sum":1.0,"max_reward":0.9,"final_reward":0.2,
+        "coverage_final":0.2,"coverage_max":0.8,"block_disp_px":20.0,"touched_right":null,"touched_left":null,
+        "lifted":null,"table_contact_steps":null,"action_flip_rate":0.1});
+    let geometry = json!({"final_object_offset":[1.0,2.0],"gripper_object_distance":3.0});
+    let prompt = brier_core::compile::explanation_prompt(
+        "gym_pusht/PushT-v0",
+        &scenario,
+        &telemetry,
+        &geometry,
+    )
+    .unwrap();
+    assert!(prompt.contains("coverage_final") && prompt.contains("action_flip_rate"));
+    assert!(!prompt.contains("\"collision_steps\"") && !prompt.contains("\"cause_family\""));
+    let state = json!({"change_id":"c001","scenario_id":"pusht-s01","features":[],
+        "questions":[{"id":"c001/pusht-s01/regressed/cheap","prompt":"compiled state<answer>","options":{"A":"yes","B":"no"}}]});
+    let escalated = brier_core::compile::escalation_prompt(&state, &json!({"regressed":{"yes":0.4,"no":0.6}}),
+        0.5,&json!({"observations":[telemetry.clone(),telemetry.clone(),telemetry.clone()],"frames":[]})).unwrap();
+    assert!(
+        escalated.contains("coverage_final") && escalated.contains("CALIBRATED_THRESHOLD: 0.5")
+    );
+    telemetry["cause_family"] = json!("hidden injected truth");
+    assert!(brier_core::compile::explanation_prompt(
+        "gym_pusht/PushT-v0",
+        &scenario,
+        &telemetry,
+        &geometry
+    )
+    .is_err());
+    telemetry.as_object_mut().unwrap().remove("cause_family");
+    telemetry["action_flip_rate"] = json!(2.0);
+    assert!(brier_core::compile::explanation_prompt(
+        "gym_pusht/PushT-v0",
+        &scenario,
+        &telemetry,
+        &geometry
+    )
+    .is_err());
+    telemetry["action_flip_rate"] = json!(0.1);
+    for key in ["coverage_final", "coverage_max", "block_disp_px"] {
+        telemetry[key] = Value::Null;
+    }
+    telemetry["touched_right"] = json!(true);
+    telemetry["touched_left"] = json!(false);
+    telemetry["lifted"] = json!(true);
+    telemetry["table_contact_steps"] = json!(12);
+    assert!(brier_core::compile::explanation_prompt(
+        "gym_aloha/AlohaTransferCube-v0",
+        &scenario,
+        &telemetry,
+        &geometry
+    )
+    .is_ok());
+}
