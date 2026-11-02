@@ -17,7 +17,7 @@ from PIL import Image
 
 
 def segment_image(path: Path, prompt: str) -> list[np.ndarray]:
-    """Segment an actual PNG with Rust's exact noun prompt into source-coordinate binary masks."""
+    """Segment an actual PNG or JPEG with Rust's noun prompt into source-coordinate binary masks."""
     key = os.environ.get("META_API_KEY", "").strip()
     if not key:
         raise ValueError("META_API_KEY is required")
@@ -27,11 +27,12 @@ def segment_image(path: Path, prompt: str) -> list[np.ndarray]:
         raise ValueError("a nonempty Rust-compiled SAM prompt is required")
     raw = path.read_bytes()
     with Image.open(io.BytesIO(raw)) as image:
-        if image.format != "PNG":
-            raise ValueError("SAM input must be an actual PNG image")
+        if image.format not in ("PNG", "JPEG"):
+            raise ValueError("SAM input must be an actual PNG or JPEG image")
+        media_type = "image/png" if image.format == "PNG" else "image/jpeg"
         width, height = image.size
         image.verify()
-    image_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    image_url = f"data:{media_type};base64," + base64.b64encode(raw).decode("ascii")
     payload = {"model": "sam-3.1", "input": [{"type": "message", "role": "user", "content": [
         {"type": "input_text", "text": prompt}, {"type": "input_image", "image_url": image_url},
     ]}], "metadata": {"mask_encoding": "one_bit"}}
