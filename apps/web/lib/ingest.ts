@@ -1,6 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import type { changes, evaluations, failures, Json, pairs, reports } from "../db/schema.ts";
-import { readStrategies } from "./report.ts";
+import { readGuide3, readStrategies } from "./report.ts";
 
 export type IngestBundle = {
   change: typeof changes.$inferInsert;
@@ -169,6 +169,7 @@ export function validateIngest(value: unknown): IngestBundle {
     if (r.suite !== "robot" && r.suite !== "software") throw new Error("report.suite must be robot or software");
     const body = jsonObject(r.body, "report.body");
     readStrategies(body);
+    readGuide3(body);
     bundle.report = {
       id: uuid(r.id, "report.id"), suite: r.suite,
       createdAt: date(r.createdAt, "report.createdAt"), body,
