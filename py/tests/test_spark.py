@@ -118,13 +118,25 @@ def test_missing_key_invalid_png_and_invalid_advice_fail(tmp_path, monkeypatch) 
     assert not calls
     monkeypatch.setenv("META_API_KEY", "unit-test-secret")
     bad = tmp_path / "not-png.png"
-    Image.new("RGB", (2, 2)).save(bad, format="JPEG")
+    Image.new("RGB", (2, 2)).save(bad, format="GIF")
     with pytest.raises(ValueError, match="actual PNG"):
         spark.escalate("Rust prompt", [bad])
     assert not calls
     with pytest.raises(ValueError, match="recommendation"):
         spark.escalate("Rust prompt", paths[:1])
     assert len(calls) == 1
+
+
+def test_muse_accepts_mixed_jpeg_raw_and_png_overlay_images(tmp_path, monkeypatch):
+    paths, calls = fixture(tmp_path, monkeypatch)
+    for path in paths[::2]:
+        Image.new("RGB", (3, 4)).save(path, format="JPEG")
+    response(monkeypatch, {"failure_mode": "collision", "cause_hypothesis": "Observed contact",
+                          "evidence_frames": [0], "suggested_check": "Inspect contact"}, calls)
+    spark.explain("Rust prompt", paths)
+    images = calls[0]["payload"]["messages"][0]["content"][1:]
+    assert all(image["image_url"]["url"].startswith(f"data:image/{'jpeg' if i % 2 == 0 else 'png'};base64,")
+               for i, image in enumerate(images))
 
 
 @pytest.mark.parametrize("content", ['{"recommend":"no_change","recommend":"run_expensive","rationale":"x"}',
