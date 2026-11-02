@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import math
@@ -30,8 +31,36 @@ def _forward(model, batch: dict, letters: list[int], norm) -> tuple:
             hook.remove()
 
 
+def _extension_rows(compiled_source: bytes, ids_source: bytes,
+                    splits: tuple = ("calibration", "test", "ood")) -> tuple[list, list]:
+    ids = json.loads(ids_source)
+    if (not isinstance(ids, list) or not ids
+            or any(not isinstance(i, str) or not i.startswith("c") or not i[1:].isdigit()
+                   or int(i[1:]) <= 160 for i in ids) or len(set(ids)) != len(ids)):
+        raise ValueError("ids-from requires distinct held-out extension IDs after c160")
+    rows, tokenization_rows, identities, split_map = [], [], set(), {}
+    for line in compiled_source.decode().splitlines():
+        row = json.loads(line)
+        checked = row.copy()
+        change = row.get("change_id", "")
+        if change.startswith("c") and change[1:].isdigit() and int(change[1:]) > 160 and row.get("split") == "calibration":
+            bucket = int.from_bytes(hashlib.sha256(change.encode()).digest()[:4], "big") % 10
+            checked["split"] = "train" if bucket < 6 else "calibration" if bucket < 8 else "test"
+        data._validate(checked, identities, split_map)
+        if row["change_id"] in ids and row["split"] in splits:
+            rows.append(row)
+            tokenization_rows.append(checked)
+    if {row["id"].split(":")[0] for row in rows} != set(ids) or any(row["split"] == "train" for row in rows):
+        raise ValueError("ids-from must cover complete non-training changes")
+    for change in ids:
+        selected = [row for row in rows if row["id"].split(":")[0] == change]
+        if len(selected) != 96 or len({row["scenario_id"] for row in selected}) != 16:
+            raise ValueError("ids-from excludes partial changes: all 16 scenarios and six questions/variants required")
+    return rows, tokenization_rows
+
+
 def _run(out_dir: Path, splits: tuple, adapter: Path | None,
-         max_usd: float, usd_per_sec: float | None) -> dict:
+         max_usd: float, usd_per_sec: float | None, ids_from: Path | None = None) -> dict:
     from brier_ml.modal_train import BASE_DIR
 
     if (not splits or len(set(splits)) != len(splits) or set(splits) - set(_SPLITS)
@@ -47,8 +76,13 @@ def _run(out_dir: Path, splits: tuple, adapter: Path | None,
     rate = usd_per_sec if usd_per_sec is not None else {"bf16": 0.001097, "nf4": 0.000694}[quant]
     if not math.isfinite(rate) or rate <= 0:
         raise ValueError("Scoring GPU rate must be finite and positive")
-    rows = data.load_examples(Path(os.environ["BRIER_DATA"]) / "compiled.jsonl", splits)
-    if set(splits) - {row["split"] for row in rows}:
+    compiled = (ids_from.parent if ids_from else Path(os.environ["BRIER_DATA"])) / "compiled.jsonl"
+    if ids_from is not None:
+        rows, tokenization_rows = _extension_rows(compiled.read_bytes(), ids_from.read_bytes(), splits)
+    else:
+        rows = data.load_examples(compiled, splits)
+        tokenization_rows = rows
+    if ids_from is None and set(splits) - {row["split"] for row in rows}:
         raise ValueError("Every requested scoring split must have examples")
     result, embeddings, cursor = [], [], 0
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -69,7 +103,9 @@ def _run(out_dir: Path, splits: tuple, adapter: Path | None,
 
         model = PeftModel.from_pretrained(model, adapter / "adapter", is_trainable=False)
     model.eval()
-    encoded, letters = data.tokenize(rows, tokenizer), data.letter_token_ids(tokenizer)
+    encoded, letters = data.tokenize(tokenization_rows, tokenizer), data.letter_token_ids(tokenizer)
+    for row, original in zip(encoded, rows, strict=True):
+        row["split"] = original["split"]
     base = model.get_base_model() if hasattr(model, "get_base_model") else model
     norm = base.get_submodule(info["final_norm"]) if adapter is None else None
     device, size = next(model.parameters()).device, 32
@@ -122,7 +158,10 @@ def _run(out_dir: Path, splits: tuple, adapter: Path | None,
     (out_dir / "score_checkpoint.pt").unlink(missing_ok=True)
     elapsed = time.perf_counter() - started
     return {"quant": quant, "revision": revision, "seconds": elapsed,
-            "spend": elapsed * rate, "rows": cursor, "micro_batch": size}
+            "spend": elapsed * rate, "rows": cursor, "micro_batch": size,
+            **({"compiled_sha256": hashlib.sha256(compiled.read_bytes()).hexdigest(),
+                "ids_sha256": hashlib.sha256(ids_from.read_bytes()).hexdigest(),
+                "output": str(out_dir)} if ids_from else {})}
 
 
 def base_pass(out_dir: Path | str, *, max_usd: float = 3.0,
@@ -132,6 +171,11 @@ def base_pass(out_dir: Path | str, *, max_usd: float = 3.0,
 
 
 def score_adapter(run_dir: Path | str, splits: tuple = ("calibration", "test", "ood"), *,
-                  max_usd: float = 2.0, usd_per_sec: float | None = None) -> dict:
+                  max_usd: float = 2.0, usd_per_sec: float | None = None,
+                  ids_from: Path | str | None = None) -> dict:
     """Score a trained adapter using its recorded base revision and quantization."""
-    return _run(Path(run_dir), splits, Path(run_dir), max_usd, usd_per_sec)
+    ids = Path(ids_from) if ids_from is not None else None
+    output = Path(run_dir) / ("heldout-" + hashlib.sha256(ids.read_bytes()).hexdigest()[:16]) if ids else Path(run_dir)
+    if ids is not None and output.exists():
+        raise FileExistsError("held-out scoring output already exists; reconcile its outcome before retrying")
+    return _run(output, splits, Path(run_dir), max_usd, usd_per_sec, ids)
