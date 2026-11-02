@@ -138,6 +138,35 @@ def _adapter(directory: Path, model: str, revision: str) -> tuple[Any, str]:
     config = manifest.get("config") if isinstance(manifest, dict) else None
     if not isinstance(config, dict) or config.get("model_id") != model or config.get("revision") != revision:
         raise ValueError("LoRA checkpoint does not match the pinned base model")
+    recipe = config.get("recipe")
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", str(config.get("dataset_digest")))
+        or not isinstance(recipe, dict) or type(recipe.get("epochs")) is not int or recipe["epochs"] != 1
+        or config.get("smoke", False) is not False or recipe.get("max_steps") is not None
+        or ("max_steps" not in recipe and config.get("smoke") is not False)
+        or type(manifest.get("step")) is not int or manifest["step"] < 1
+    ):
+        raise ValueError("LoRA checkpoint requires a completed one-epoch dataset-bound training run")
+    if "max_steps" in recipe:
+        try:
+            meta = json.loads((directory / "run_meta.json").read_text())
+        except (OSError, ValueError) as error:
+            raise ValueError("LoRA checkpoint requires readable completed Guide 2 run_meta.json") from error
+        partition = meta.get("calibration_partition") if isinstance(meta, dict) else None
+        if (
+            not isinstance(meta, dict) or meta.get("base_repo") != model
+            or meta.get("revision") != revision or meta.get("data_sha256") != config["dataset_digest"]
+            or meta.get("config") != recipe or meta.get("steps") != manifest["step"]
+            or meta.get("epochs") != 1 or not isinstance(partition, dict)
+        ):
+            raise ValueError("LoRA checkpoint completion metadata differs from the trained adapter")
+        fit, risk = partition.get("fit_change_ids"), partition.get("risk_change_ids")
+        if (
+            not isinstance(fit, list) or not fit or not isinstance(risk, list) or len(risk) < 19
+            or not all(isinstance(value, str) and re.fullmatch(r"c[0-9]{3,}", value) for value in fit + risk)
+            or len(set(fit + risk)) != len(fit + risk)
+        ):
+            raise ValueError("LoRA checkpoint must preserve independent probability and risk change pools")
     if (
         not isinstance(adapter_config, dict) or adapter_config.get("peft_type") != "LORA"
         or type(adapter_config.get("r")) is not int or not 1 <= adapter_config["r"] <= 16
@@ -154,7 +183,7 @@ def _adapter(directory: Path, model: str, revision: str) -> tuple[Any, str]:
 
 def _load() -> tuple[_Generate, Any, str]:
     model, revision = os.environ.get("MODAL_MODEL_ID"), os.environ.get("MODAL_MODEL_REVISION")
-    if not model or not revision:
+    if not model or not revision or model.strip() != model or any(char.isspace() for char in model):
         raise ValueError("brier-model secret requires MODAL_MODEL_ID and MODAL_MODEL_REVISION")
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("MODAL_MODEL_REVISION must be an immutable 40-character Hugging Face commit")
