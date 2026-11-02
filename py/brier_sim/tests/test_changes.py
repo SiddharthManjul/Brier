@@ -223,6 +223,42 @@ def _pilot(env: str = "pusht") -> dict[str, list[dict[str, Any]]]:
             for index, (family, params) in enumerate(changes._grid(env).items())}
 
 
+def test_extension_appends_disjoint_ids_without_changing_frozen_bytes(tmp_path, monkeypatch, capsys) -> None:
+    originals = {}
+    for env in ("pusht", "aloha"):
+        originals[env] = "".join(json.dumps(card) + "\n" for card in generate_changes(env)).encode()
+        (tmp_path / f"changes_{env}.jsonl").write_bytes(originals[env])
+        (tmp_path / f"magnitudes_{env}.json").write_text(json.dumps(_pilot(env)))
+    added = []
+    for env, first in (("pusht", 161), ("aloha", 181)):
+        monkeypatch.setattr(sys, "argv", ["changes", "--env", env, "--extend", "20", "--seed", "2027", "--write", "--magnitudes", str(tmp_path / f"magnitudes_{env}.json")])
+        changes._main()
+        output = (tmp_path / f"changes_{env}.jsonl").read_bytes()
+        assert output.startswith(originals[env])
+        cards = [json.loads(line) for line in output[len(originals[env]):].splitlines()]
+        assert [c["change_id"] for c in cards] == [f"c{i:03d}" for i in range(first, first + 20)]
+        assert sum(c["families"][0]["family"] == "benign" for c in cards) == 7
+        assert sum(len(c["families"]) == 2 for c in cards) == 4
+        for card in cards:
+            assert card["env"] == env
+            for entry in card["families"]:
+                if entry["family"] != "benign":
+                    assert entry["params"] in [e["params"] for e in _pilot(env)[entry["family"]]]
+        added.extend(cards)
+    assert len({c["change_id"] for c in added}) == 40
+    assert len(capsys.readouterr().out.splitlines()) == 2
+
+
+def test_extension_generator_is_deterministic_and_preserves_distribution() -> None:
+    cards = changes.extend_changes("pusht", 20, 2027, _pilot(), 161)
+    assert cards == changes.extend_changes("pusht", 20, 2027, _pilot(), 161)
+    assert cards != changes.extend_changes("pusht", 20, 2028, _pilot(), 161)
+    assert [c["change_id"] for c in cards] == [f"c{i:03d}" for i in range(161, 181)]
+    assert Counter(0 if c["families"][0]["family"] == "benign" else len(c["families"]) for c in cards) == {0: 7, 1: 9, 2: 4}
+    with pytest.raises(ValueError, match="after c160"):
+        changes.extend_changes("pusht", 20, 2027, _pilot(), 81)
+
+
 def test_measured_pilot_restricts_params_ranks_composites_and_drops_families() -> None:
     pilot = _pilot()
     del pilot["frame_drop"], pilot["brightness"]
