@@ -161,6 +161,48 @@ After separately approving provider/GPU testing, verify `/decide` against held-o
 
 The prepared Robot CI workflow fetches the decision bundle, verifies every named file checksum including the frozen scenario IDs and seed catalog, checks the model and separate fit/risk provenance, and selects the matching PushT or ALOHA frozen baseline before any rollout. Its live report includes the measured replay metrics. The checked-in policy template deliberately has `revision: null`: replace it with the actual deployed immutable policy snapshot only when running real Robot CI is approved. Do not dispatch the workflow merely to preview the frontend.
 
+## Guide 3 compute-savings implementation
+
+Guide 3 adds an explicit executed-policy path alongside the frozen baseline replay. The original model, temperatures, train split and release are preserved. Fine-tuned temperature-scaled `noev` scores select which pairs need cheap evidence; fixed cutoffs are 0.02 and 0.90. Remaining pairs use the corresponding `ev` scores. Expensive selections run in descending probability, ties by scenario ID, in waves of four. Change mode stops after a confirmed selected regression; scenario comparison mode runs the complete selected suite. Escalation can add at most two skipped evidence-bearing pairs from the band immediately below the calibrated threshold. Provider failures remain errors.
+
+The guide’s all-change binary loss certifies the expected fraction of **all changes** that regress and are missed. It does **not** certify a 5% miss rate conditional on a change regressing. Conditional misses, actual scenario misses after stopping, and selection-only scenario misses are reported separately. If the fixed low-confidence skips or sample penalty make certification impossible, an explicit uncertified run-all policy bypasses the skips. Twenty replay splits are an empirical diagnostic, not a substitute for the exchangeability assumption.
+
+Current-data diagnostics exclude the seven probability/model-fitting changes, leaving 42 independent held-out changes. Rust and independent Python agree on all six checked thresholds to numerical equality. The current replay fails the required eighteen-of-twenty split gate; the figures below are diagnostic results, not a qualified product headline.
+
+| Level | Alpha | Production lambda | Splits within target | Mean simulation hours saved | Missed changes / all changes | Misses among regressing changes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| change | 0.05 | 0.228171803 | 14/20 | 72.61% | 4.09% | 5.78% |
+| change | 0.10 | 0.290349694 | 15/20 | 75.65% | 9.09% | 11.98% |
+| scenario | 0.05 | 0.124568517 | 14/20 | 26.37% | 2.73% | 3.85% |
+| scenario | 0.10 | 0.176006757 | 16/20 | 30.88% | 4.09% | 5.78% |
+
+Simulation-hour accounting includes cheap evaluations at the guide’s 0.075 expensive-run equivalent, full executed waves and exploration. It excludes unmeasured inference/Meta costs and unobserved T3 additions. No T0 library-wide savings are credited without a pinned identity proof. The local logging-only identity check completed with zero cheap and zero expensive evaluations; it is not a hosted PR demo.
+
+### How Brier saves compute
+
+- T0: clears an identical pinned policy without evaluations; unverified library-wide credit stays zero; current diagnostic gross share 0.00% of the run-all expensive baseline.
+- Adaptive cheap tier: avoids cheap evaluations relative to always collecting cheap evidence; current diagnostic gross share 0.77% of the run-all expensive baseline.
+- Calibrated threshold: omits expensive evaluations under the stated all-change risk target; current diagnostic gross share 37.39% of the run-all expensive baseline.
+- Early stop: avoids remaining selected runs after a confirmed regression; current diagnostic gross share 43.09% of the run-all expensive baseline.
+
+These gross shares are not additive net savings: cheap and exploration overheads are accounted for in the replay’s net total. The prepared seeded extension contains twenty new changes per environment, including seven benign changes each, and preserves every original manifest byte prefix and all thirty-two baseline files. If all complete, thirty-three new non-OOD changes increase the independent production pool from 42 to 75; incomplete changes are excluded. Collection/scoring and the final gate remain pending.
+
+### Honest limits
+
+Guarantees apply to the explicitly named loss over exchangeable calibration and future changes. Pooled calibration does not establish a separate guarantee per environment or under OOD shift. Reusing the former test changes for production risk calibration consumes their untouched-test status. The original probability-ECE acceptance target remains unchanged. Deployment and public model/data publication remain on hold.
+
+Generate fresh local outputs without overwriting an existing artifact:
+
+```bash
+cargo build --locked --bin brier
+PYTHONPATH=py PATH="$PWD/target/debug:$PATH" .venv/bin/python -m brier_ml.policy_diag \
+  --compiled data/rollout-v1/compiled.jsonl --probs data/runs/glimmer-ft-v1/probs_temp \
+  --ledger data/rollout-v1/ledger.sqlite --out data/guide3/diag-recheck --pooled-heldout --guarantee change
+cargo run --locked --bin brier -- replay --ledger data/rollout-v1/ledger.sqlite \
+  --compiled data/rollout-v1/compiled.jsonl --probs data/runs/glimmer-ft-v1/probs_temp \
+  --alphas 0.05,0.10 --guarantee change --out data/guide3/report-change-recheck.json
+```
+
 ## Implementation audit, November 2
 
 The four-page application and Robot CI source are implemented, with local contract tests. Credential-backed acceptance is still pending. This is not a claim that the entire submission is finished.
