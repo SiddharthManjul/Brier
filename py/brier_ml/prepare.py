@@ -228,7 +228,7 @@ def prepare_bundle(dataset: Path, runs: Path, readiness: Path, output: Path,
         "changes": [{"change_id": change, "pairs": sorted(groups[change], key=lambda p: p["scenario_id"])}
                     for change in risk],
     })
-    for name in ("ledger.sqlite", "compiled.jsonl"):
+    for name in ("ledger.sqlite", "compiled.jsonl", "scenarios.jsonl"):
         shutil.copyfile(dataset / name, output / name)
         if _hash(output / name) != release_hashes[name]:
             raise ValueError("bundle copy differs from released input")
