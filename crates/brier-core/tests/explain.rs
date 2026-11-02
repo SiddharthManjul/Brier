@@ -128,6 +128,9 @@ mode=(root/'mode').read_text()
 assert 'HIDDEN_INJECTION' not in json.dumps(p) and 'HIDDEN_CARD' not in json.dumps(p)
 with (root/'calls').open('a') as stream: stream.write(p['operation']+'\n')
 if mode=='bridge_failure': raise SystemExit('fixture provider rejected request')
+if p['operation']=='guide_evidence':
+    json.dump(json.loads((root/'guide-evidence.json').read_text()),sys.stdout)
+    raise SystemExit(0)
 rows=[]
 for source in p['episodes']:
     if p['operation']=='segment':
@@ -366,4 +369,79 @@ fn score_explanations_separates_heldout_splits_and_never_fills_missing_metrics_w
     )
     .unwrap();
     assert!(brier_core::explain::score_explanations(&f.ledger, &compiled).is_err());
+}
+
+#[test]
+fn authoritative_guide_uuid_requires_exact_ledger_identity_and_observed_fields() {
+    let mut f = fixture("valid");
+    let connection = Connection::open(&f.ledger).unwrap();
+    let run = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"c002:pusht-s01:expensive").to_string();
+    connection
+        .execute_batch("DROP TRIGGER runs_no_UPDATE;")
+        .unwrap();
+    connection
+        .execute("UPDATE runs SET run_id=?1", [&run])
+        .unwrap();
+    f.run = run;
+    let frames: Vec<_> = (0..8).map(|index| json!({"index":index,"path":f.directory.join(format!("public/keyframes/failed/frame-{index:04}.png"))})).collect();
+    let telemetry = json!({"steps":10,"max_steps":10,"reward_sum":1.0,"max_reward":0.9,"final_reward":0.2,
+        "coverage_final":0.2,"coverage_max":0.8,"block_disp_px":20.0,"touched_right":null,"touched_left":null,
+        "lifted":null,"table_contact_steps":null,"action_flip_rate":0.1});
+    fs::write(
+        f.directory.join("guide-evidence.json"),
+        json!({"env":"gym_pusht/PushT-v0",
+        "scenario":{"pose_bin":0,"lighting":"normal","camera_jitter":false},
+        "episodes":[{"seed":19,"telemetry":telemetry,"frames":frames}]})
+        .to_string(),
+    )
+    .unwrap();
+    let guide_path = f.directory.join("guide-evidence.json");
+    let valid = fs::read_to_string(&guide_path).unwrap();
+    let mut leaked: Value = serde_json::from_str(&valid).unwrap();
+    leaked["episodes"][0]["telemetry"]["cause_family"] = json!("hidden");
+    fs::write(&guide_path, leaked.to_string()).unwrap();
+    let rejected = command(&f);
+    assert!(!rejected.status.success());
+    assert_eq!(
+        fs::read_to_string(f.directory.join("calls")).unwrap(),
+        "guide_evidence\n"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM explanations", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    fs::write(&guide_path, valid).unwrap();
+    fs::remove_file(f.directory.join("calls")).unwrap();
+    let result = command(&f);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["run_id"], f.run);
+    assert_eq!(
+        fs::read_to_string(f.directory.join("calls")).unwrap(),
+        "guide_evidence\nsegment\nexplain\n"
+    );
+}
+
+#[test]
+fn unrelated_v5_run_is_rejected_before_any_bridge_operation() {
+    let mut f = fixture("valid");
+    let connection = Connection::open(&f.ledger).unwrap();
+    f.run = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"unrelated ledger identity").to_string();
+    connection
+        .execute_batch("DROP TRIGGER runs_no_UPDATE;")
+        .unwrap();
+    connection
+        .execute("UPDATE runs SET run_id=?1", [&f.run])
+        .unwrap();
+    let result = command(&f);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("authoritative ledger identity"));
+    assert!(!f.directory.join("calls").exists());
 }
