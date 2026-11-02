@@ -6,6 +6,7 @@ import logging
 import math
 import re
 import statistics
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
@@ -100,6 +101,56 @@ def download_weights() -> None:
 RATES = {"bf16": 0.001097, "nf4": 0.000694}  # Guide 2 USD/s; verify current official rates before launch.
 _GPU = {"image": IMAGE, "volumes": {"/models": MODELS, "/data": DATA}, "secrets": [HF],
             "env": {"BRIER_DATA": "/data"}, "retries": 0, "max_containers": 1}
+_TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "config.json",
+                    "special_tokens_map.json", "added_tokens.json", "chat_template.jinja")
+
+
+def _validated_spend(records: list) -> float:
+    if not isinstance(records, list) or any(not isinstance(row, dict)
+            or not isinstance(row.get("step"), str) or not row["step"]
+            or type(row.get("spend")) not in (int, float)
+            or not math.isfinite(row["spend"]) or row["spend"] < 0 for row in records):
+        raise ValueError("Spend ledger requires finite nonnegative amounts and named steps")
+    if any(row.get("status") not in {"complete", "failed"} for row in records):
+        raise RuntimeError("Unresolved GPU reservation or outcome blocks new paid operations")
+    total = sum(row["spend"] for row in records)
+    if not math.isfinite(total):
+        raise ValueError("Aggregate spend must be finite")
+    return total
+
+
+def _extension_preflight(ids_from: str, metadata: dict) -> dict:
+    from transformers import AutoTokenizer
+
+    from brier_ml import glimmer_data
+    from brier_ml.score import _extension_rows
+
+    relative = Path(ids_from).relative_to("/data")
+    ids = b"".join(DATA.read_file(str(relative)))
+    compiled = b"".join(DATA.read_file(str(relative.parent / "compiled.jsonl")))
+    rows, checked = _extension_rows(compiled, ids)
+    base = Path(BASE_DIR).relative_to("/models")
+    revision = b"".join(MODELS.read_file(str(base / "revision.txt"))).decode().strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", revision) or metadata.get("revision") != revision:
+        raise ValueError("Held-out scoring requires the adapter's exact pinned base revision")
+    artifacts = {}
+    with tempfile.TemporaryDirectory(prefix="brier-score-tokenizer-") as temporary:
+        for name in _TOKENIZER_FILES:
+            try:
+                source = b"".join(MODELS.read_file(str(base / name)))
+            except FileNotFoundError:
+                if name in {"tokenizer.json", "tokenizer_config.json", "config.json"}:
+                    raise
+                continue
+            (Path(temporary) / name).write_bytes(source)
+            artifacts[name] = hashlib.sha256(source).hexdigest()
+        tokenizer = AutoTokenizer.from_pretrained(temporary, local_files_only=True)
+        glimmer_data.tokenize(checked, tokenizer)
+    proof = {"compiled": hashlib.sha256(compiled).hexdigest(), "ids": hashlib.sha256(ids).hexdigest(),
+             "revision": revision, "tokenizer": artifacts, "rows": len(rows)}
+    LOGGER.info("Verified held-out scoring inputs before GPU launch: %s", proof)
+    return proof
+
 
 @contextmanager
 def _attempt(step: str, quant: str, max_usd: float, cap: float):
@@ -111,8 +162,11 @@ def _attempt(step: str, quant: str, max_usd: float, cap: float):
     ledger = Path("/models/runs/spend.json")
     ledger.parent.mkdir(parents=True, exist_ok=True)
     records = json.loads(ledger.read_text()) if ledger.exists() else []
+    spent = _validated_spend(records)
+    if step == "score" and sum(row["spend"] for row in records if row.get("step") == "score") + max_usd > cap:
+        raise RuntimeError("Cumulative scoring $2 cap would be exceeded, including unresolved reservations")
     max_usd -= sum(row["spend"] for row in records if row.get("step") == step) if ":" in step else 0
-    if max_usd <= 0 or sum(row["spend"] for row in records) + max_usd > 22:
+    if max_usd <= 0 or spent + max_usd > 22:
         raise RuntimeError("Training pool $22 cap would be exceeded, including unresolved reservations")
     record = {"id": str(uuid.uuid4()), "step": step, "quant": quant, "status": "reserved", "spend": max_usd}
     records.append(record)
@@ -208,31 +262,55 @@ def train_fn(run_id: str, quant: str, micro_batch: int, max_steps: int | None,
         return record
 
 @APP.function(**_GPU, gpu="H100", timeout=3600)
-def score_fn(run_id: str, max_usd: float = 2.0) -> dict:
+def score_fn(run_id: str, max_usd: float = 2.0, ids_from: str = "", input_sha256: dict | None = None) -> dict:
     """Score a trained adapter using its recorded quantization and shared budget."""
     MODELS.reload()
     run = Path("/models/runs") / run_id
-    quant = json.loads((run / "run_meta.json").read_text())["quant"]
+    metadata = json.loads((run / "run_meta.json").read_text())
+    quant = metadata["quant"]
+    if ids_from:
+        from brier_ml.score import _extension_rows
+
+        path = Path(ids_from)
+        if (not ids_from.startswith("/data/") or ".." in path.parts or not isinstance(input_sha256, dict)
+                or not isinstance(input_sha256.get("tokenizer"), dict)
+                or not set(_TOKENIZER_FILES[:3]) <= set(input_sha256["tokenizer"]) <= set(_TOKENIZER_FILES)):
+            raise ValueError("Held-out scoring requires a verified prelaunch input proof")
+        compiled, ids = (path.parent / "compiled.jsonl").read_bytes(), path.read_bytes()
+        rows, _ = _extension_rows(compiled, ids)
+        artifacts = {name: hashlib.sha256((Path(BASE_DIR) / name).read_bytes()).hexdigest()
+                     for name in input_sha256.get("tokenizer", {})}
+        revision = (Path(BASE_DIR) / "revision.txt").read_text().strip()
+        proof = {"compiled": hashlib.sha256(compiled).hexdigest(), "ids": hashlib.sha256(ids).hexdigest(),
+                 "revision": revision, "tokenizer": artifacts, "rows": len(rows)}
+        if proof != input_sha256 or metadata["revision"] != revision:
+            raise ValueError("Held-out scoring inputs changed after CPU preflight")
     with _attempt("score", quant, max_usd, 2) as (record, remaining):
         from brier_ml.score import score_adapter
-        record["result"] = score_adapter(run, max_usd=remaining(), usd_per_sec=RATES[quant])
+        options = {"ids_from": Path(ids_from)} if ids_from else {}
+        record["result"] = score_adapter(run, max_usd=remaining(), usd_per_sec=RATES[quant], **options)
+        if input_sha256:
+            record["input_sha256"] = input_sha256
         return record
 
 @APP.local_entrypoint()
 def main(step: str, run_id: str = "glimmer-ft-v1", quant: str = "bf16",
          micro_batch: int = 8, max_steps: int = 0, epochs: int = 1,
-         max_usd: float = 12.0, init_adapter: str = "", lr: float = 1e-4) -> None:
+         max_usd: float = 12.0, init_adapter: str = "", lr: float = 1e-4, ids_from: str = "") -> None:
     """Dispatch one blocking, budget-limited Modal job with the selected GPU."""
     logging.basicConfig(level=logging.INFO)
     if step not in {"download", "check", "base", "smoke", "train", "score"} or quant not in RATES:
         raise ValueError("Unknown training step or quantization")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", run_id) or not math.isfinite(max_usd) or max_usd <= 0:
         raise ValueError("Expected a safe run id and positive finite max_usd")
+    if ids_from and (step != "score" or not ids_from.startswith("/data/") or ".." in Path(ids_from).parts):
+        raise ValueError("ids-from is only allowed for scoring an existing file under /data")
     if step == "download":
         return download_weights.remote()
     if step in {"base", "score", "smoke", "train"}:
         source = f"runs/{run_id}/run_meta.json" if step == "score" else "runs/check.json"
-        selected = json.loads(b"".join(MODELS.read_file(source)))["quant"]
+        metadata = json.loads(b"".join(MODELS.read_file(source)))
+        selected = metadata["quant"]
         quant = selected if step in {"base", "score"} or selected == "nf4" else quant
     cap = min(max_usd, 3 if step == "train" and max_steps == 50 else {"check": 1, "base": 3, "smoke": 3, "train": 12, "score": 2}[step])
     function = {"check": check, "base": base_pass_fn, "smoke": train_fn, "train": train_fn, "score": score_fn}[step]
@@ -240,13 +318,16 @@ def main(step: str, run_id: str = "glimmer-ft-v1", quant: str = "bf16",
         records = json.loads(b"".join(MODELS.read_file("runs/spend.json")))
     except FileNotFoundError:
         records = []
-    spent = sum(row["spend"] for row in records)
+    spent = _validated_spend(records)
+    if step == "score" and sum(row["spend"] for row in records if row.get("step") == "score") + cap > 2:
+        raise RuntimeError("Cumulative scoring $2 cap would be exceeded before GPU launch")
     budget = cap - sum(row["spend"] for row in records if row.get("step") == f'{"smoke" if step == "train" and max_steps == 50 else step}:{run_id}') if step in {"smoke", "train"} else cap
     if budget <= 0 or spent >= 22 or (step not in {"smoke", "train"} and spent + cap > 22):
         raise RuntimeError("Training pool $22 cap would be exceeded before GPU launch")
     timeout = min({"check": 1800, "base": 7200, "smoke": 14400, "train": 14400, "score": 3600}[step], math.floor(min(budget, 22 - spent) / RATES[quant]))
     if timeout < 1: raise ValueError("Budget is too small for one billed GPU second")
+    proof = _extension_preflight(ids_from, metadata) if ids_from else None
     function = function.with_options(gpu="A100-80GB" if quant == "nf4" else "H100", timeout=timeout)
     args = (quant, cap) if step == "check" else ((cap,) if step == "base" else ((run_id, cap) if step == "score" else
         (run_id, quant, micro_batch, 50 if step == "smoke" else max_steps or None, epochs, cap, init_adapter, lr)))
-    LOGGER.info("Modal result %s", function.remote(*args))
+    LOGGER.info("Modal result %s", function.remote(*args, **({"ids_from": ids_from, "input_sha256": proof} if ids_from else {})))
