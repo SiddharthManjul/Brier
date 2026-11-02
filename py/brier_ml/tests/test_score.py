@@ -1,4 +1,14 @@
+import ast
+import hashlib
 import json
+import logging
+import math
+import re
+import tempfile
+import types
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -114,6 +124,59 @@ def test_adapter_loads_actual_lora_and_recorded_nf4_quantization(setup):
         actual = _read(run / "probs" / f"{split}.jsonl")
         assert [r["id"] for r in actual] == [r["id"] for r in rows if r["split"] == split]
         assert all(r["model"] == "glimmer-ft-glimmer-ft-test" for r in actual)
+
+
+def test_heldout_ids_score_complete_extension_without_overwriting_existing_outputs(setup, monkeypatch):
+    root, model, tokenizer, _, loads, _ = setup
+    run = root / "models/runs/glimmer-ft-test"
+    run.mkdir()
+    (run / "run_meta.json").write_text(json.dumps({"revision": "a" * 40, "quant": "bf16"}))
+    gm.add_lora(model).save_pretrained(run / "adapter")
+    fresh = tf.LlamaForCausalLM(model.config).eval()
+    monkeypatch.setattr(gm, "load_base", lambda *args: (loads.append(args) or (fresh, tokenizer, {"final_norm": "model.norm"})))
+    rows = []
+    for scenario in range(1, 17):
+        for question in ("regressed", "failure_mode", "success_bucket"):
+            for variant in ("ev", "noev"):
+                row = _row(question, "calibration", "pusht", variant)
+                old, old_scenario = row["change_id"], row["scenario_id"]
+                for key in ("id", "pair_id", "prompt"):
+                    row[key] = row[key].replace(old, "c161").replace(old_scenario, f"pusht-s{scenario:02d}")
+                row.update(change_id="c161", scenario_id=f"pusht-s{scenario:02d}")
+                rows.append(row)
+    compiled = root / "data/compiled.jsonl"
+    compiled.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    ids = root / "data/new-ids.json"
+    ids.write_text(json.dumps(["c161"]))
+    (run / "probs").mkdir()
+    (run / "probs/calibration.jsonl").write_text("preserved-original\n")
+    result = score.score_adapter(run, ids_from=ids, usd_per_sec=1e-12)
+    output = root / result["output"]
+    assert result["rows"] == 96 and output != run
+    assert (run / "probs/calibration.jsonl").read_text() == "preserved-original\n"
+    assert {row["id"] for row in _read(output / "probs/calibration.jsonl")} == {row["id"] for row in rows}
+    before = len(loads)
+    with pytest.raises(FileExistsError, match="reconcile"):
+        score.score_adapter(run, ids_from=ids, usd_per_sec=1e-12)
+    assert len(loads) == before
+
+
+def test_heldout_ids_reject_partial_changes_before_loading_model(setup):
+    root, _model, _, _, loads, _ = setup
+    run = root / "models/runs/glimmer-ft-test"
+    run.mkdir()
+    (run / "run_meta.json").write_text(json.dumps({"revision": "a" * 40, "quant": "bf16"}))
+    ids = root / "data/new-ids.json"
+    ids.write_text(json.dumps(["c161"]))
+    row = _row("regressed", "calibration", "pusht", "ev")
+    old = row["change_id"]
+    for key in ("id", "pair_id", "prompt"):
+        row[key] = row[key].replace(old, "c161")
+    row["change_id"] = "c161"
+    (root / "data/compiled.jsonl").write_text(json.dumps(row) + "\n")
+    with pytest.raises(ValueError, match="partial changes"):
+        score.score_adapter(run, ids_from=ids)
+    assert not loads
 
 
 def test_oom_halves_same_batch_without_duplicates_and_removes_hooks(setup, monkeypatch, caplog):
@@ -235,3 +298,189 @@ def test_invalid_budget_rejected_before_model_loading(setup, arguments):
     with pytest.raises(ValueError):
         score.base_pass(root / "base", **arguments)
     assert not loads
+
+
+def _modal_ast(names, namespace):
+    nodes = []
+    for node in ast.parse(Path(modal_train.__file__).read_text()).body:
+        if isinstance(node, ast.FunctionDef) and node.name in names:
+            node.decorator_list = [d for d in node.decorator_list if isinstance(d, ast.Name) and d.id == "contextmanager"]
+            nodes.append(node)
+    exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), modal_train.__file__, "exec"), namespace)  # noqa: S102 - isolates real entrypoints from the Modal SDK
+    return namespace
+
+
+def _extension_fixture():
+    rows = []
+    for scenario in range(1, 17):
+        for question in ("regressed", "failure_mode", "success_bucket"):
+            for variant in ("ev", "noev"):
+                row = _row(question, "calibration", "pusht", variant)
+                change, old = row["change_id"], row["scenario_id"]
+                for key in ("id", "pair_id", "prompt"):
+                    row[key] = row[key].replace(change, "c161").replace(old, f"pusht-s{scenario:02d}")
+                row.update(change_id="c161", scenario_id=f"pusht-s{scenario:02d}")
+                rows.append(row)
+    return "".join(json.dumps(row) + "\n" for row in rows).encode()
+
+
+def _modal_offline(monkeypatch, tokenizer, records, ids=b'["c161"]', compiled=None):
+    events = []
+    class Volume:
+        def __init__(self, files, name):
+            self.files, self.name = files, name
+        def read_file(self, name):
+            events.append(("read", self.name, name))
+            if name not in self.files:
+                raise FileNotFoundError(name)
+            return [self.files[name]]
+    data_files = {"guide3/compiled.jsonl": _extension_fixture() if compiled is None else compiled}
+    if ids is not None:
+        data_files["guide3/ids.json"] = ids
+    model_files = {"runs/glimmer-ft-v1/run_meta.json": json.dumps({"quant": "bf16", "revision": "a" * 40}).encode(),
+                   "runs/check.json": b'{"quant":"bf16"}', "runs/spend.json": json.dumps(records).encode(),
+                   "base/muse-glimmer-30b/revision.txt": ("a" * 40).encode()}
+    model_files.update({f"base/muse-glimmer-30b/{name}": b"{}" for name in modal_train._TOKENIZER_FILES[:3]})
+    namespace = {"Path": Path, "json": json, "math": math, "re": re, "hashlib": hashlib, "logging": logging,
+                 "tempfile": tempfile, "LOGGER": logging.getLogger("offline-modal"), "RATES": modal_train.RATES,
+                 "BASE_DIR": modal_train.BASE_DIR, "_TOKENIZER_FILES": modal_train._TOKENIZER_FILES,
+                 "MODELS": Volume(model_files, "models"), "DATA": Volume(data_files, "data")}
+    def tokenizer_load(*_args, **kwargs):
+        assert kwargs == {"local_files_only": True}
+        events.append(("cpu_tokenizer",))
+        return tokenizer
+    monkeypatch.setattr(tf.AutoTokenizer, "from_pretrained", tokenizer_load)
+    for name in ("download_weights", "check", "base_pass_fn", "train_fn", "score_fn"):
+        function = types.SimpleNamespace()
+        def options(_name=name, _function=function, **kwargs):
+            events.append(("gpu_options", _name, kwargs))
+            return _function
+        def remote(*args, _name=name, **kwargs):
+            events.append(("gpu_remote", _name, args, kwargs))
+            return {"offline": True}
+        function.with_options, function.remote = options, remote
+        namespace[name] = function
+    return _modal_ast({"main", "_validated_spend", "_extension_preflight"}, namespace), events, data_files
+
+
+def test_modal_extension_preflight_uses_real_validation_and_tokenizer_before_forwarding(monkeypatch):
+    namespace, events, files = _modal_offline(monkeypatch, _BPE(), [{"step": "score", "status": "complete", "spend": .3}])
+    namespace["main"]("score", max_usd=1, ids_from="/data/guide3/ids.json")
+    call = next(event for event in events if event[0] == "gpu_remote")
+    assert call[1:3] == ("score_fn", ("glimmer-ft-v1", 1))
+    assert call[3]["ids_from"] == "/data/guide3/ids.json"
+    proof = call[3]["input_sha256"]
+    assert proof["compiled"] == hashlib.sha256(files["guide3/compiled.jsonl"]).hexdigest()
+    assert proof["ids"] == hashlib.sha256(files["guide3/ids.json"]).hexdigest()
+    assert proof["rows"] == 96 and proof["revision"] == "a" * 40
+    assert set(proof["tokenizer"]) == set(modal_train._TOKENIZER_FILES[:3])
+    assert next(i for i, e in enumerate(events) if e[0] == "cpu_tokenizer") < next(i for i, e in enumerate(events) if e[0] == "gpu_options")
+    assert ("read", "data", "compiled.jsonl") not in events
+
+
+@pytest.mark.parametrize("fault", ["missing", "malformed", "duplicate", "partial", "tokenizer", "traversal"])
+def test_modal_invalid_extension_fails_before_any_gpu_request(monkeypatch, fault):
+    ids = None if fault == "missing" else b"not-json" if fault == "malformed" else b'["c161","c161"]' if fault == "duplicate" else b'["c161"]'
+    compiled = _extension_fixture()
+    if fault == "partial":
+        compiled = compiled.splitlines()[0] + b"\n"
+    tokenizer = _BPE()
+    if fault == "tokenizer":
+        tokenizer.pad_token_id = None
+        tokenizer.eos_token_id = None
+    namespace, events, _ = _modal_offline(monkeypatch, tokenizer, [], ids=ids, compiled=compiled)
+    with pytest.raises((ValueError, FileNotFoundError)):
+        namespace["main"]("score", max_usd=1, ids_from="/data/../bad.json" if fault == "traversal" else "/data/guide3/ids.json")
+    assert not any(event[0].startswith("gpu_") for event in events)
+
+
+@pytest.mark.parametrize("record", [{"step": "score", "status": "reserved", "spend": .2},
+    {"step": "train:other", "status": "running", "spend": .2}, {"step": "score", "spend": .2},
+    {"step": "score", "status": "complete", "spend": -1}, {"step": "score", "status": "complete", "spend": float("nan")},
+    {"step": "score", "status": "complete", "spend": float("inf")}, {"step": "score", "status": "complete", "spend": 1.5}])
+def test_modal_unresolved_invalid_or_exhausted_spend_blocks_before_launch(monkeypatch, record):
+    namespace, events, _ = _modal_offline(monkeypatch, _BPE(), [record])
+    with pytest.raises((ValueError, RuntimeError)):
+        namespace["main"]("score", max_usd=1, ids_from="/data/guide3/ids.json")
+    assert not any(event[0].startswith("gpu_") for event in events)
+    assert not any(event[:2] == ("read", "data") for event in events)
+
+
+@pytest.mark.parametrize("records", [[{"step": "score", "status": "reserved", "spend": .2}],
+    [{"step": "score", "status": "complete", "spend": -1}], [{"step": "score", "status": "complete", "spend": float("nan")}],
+    [{"step": "score", "status": "complete", "spend": 1.5}]])
+def test_modal_attempt_rejects_invalid_reservations_without_writing(tmp_path, records):
+    ledger = tmp_path / "spend.json"
+    ledger.write_text(json.dumps(records))
+    before = ledger.read_bytes()
+    commits = []
+    namespace = {"Path": lambda *_: ledger, "json": json, "math": math, "logging": logging,
+                 "LOGGER": logging.getLogger("offline-modal"), "RATES": modal_train.RATES,
+                 "time": types.SimpleNamespace(perf_counter=lambda: 0.0), "uuid": uuid,
+                 "contextmanager": contextmanager, "MODELS": types.SimpleNamespace(reload=lambda: None, commit=lambda: commits.append(True))}
+    _modal_ast({"_attempt", "_validated_spend"}, namespace)
+    with pytest.raises((ValueError, RuntimeError)), namespace["_attempt"]("score", "bf16", 1, 2):
+        pytest.fail("Invalid reservation reached paid work")
+    assert ledger.read_bytes() == before and not commits
+
+
+def test_modal_legacy_score_has_no_extension_option_or_tokenizer_preflight(monkeypatch):
+    namespace, events, _ = _modal_offline(monkeypatch, _BPE(), [{"step": "score", "status": "complete", "spend": .3}])
+    namespace["main"]("score", max_usd=1)
+    call = next(event for event in events if event[0] == "gpu_remote")
+    assert call[1:4] == ("score_fn", ("glimmer-ft-v1", 1), {})
+    assert not any(event[0] == "cpu_tokenizer" or event[:2] == ("read", "data") for event in events)
+
+
+@pytest.mark.parametrize("fault", [None, "compiled", "ids", "tokenizer", "revision", "missing-proof", "asset-path"])
+def test_modal_extension_remote_rechecks_prelaunch_proof_before_reserving(tmp_path, monkeypatch, fault):
+    namespace, events, files = _modal_offline(monkeypatch, _BPE(), [])
+    namespace["main"]("score", max_usd=1, ids_from="/data/guide3/ids.json")
+    proof = next(event for event in events if event[0] == "gpu_remote")[3]["input_sha256"]
+    data = tmp_path / "data/guide3"
+    data.mkdir(parents=True)
+    for name, contents in files.items():
+        (data / Path(name).name).write_bytes(contents)
+    base = tmp_path / "models/base/muse-glimmer-30b"
+    base.mkdir(parents=True)
+    for name in modal_train._TOKENIZER_FILES[:3]:
+        (base / name).write_bytes(b"{}")
+    (base / "revision.txt").write_text("a" * 40)
+    run = tmp_path / "models/runs/glimmer-ft-v1"
+    run.mkdir(parents=True)
+    (run / "run_meta.json").write_text(json.dumps({"quant": "bf16", "revision": "a" * 40}))
+    if fault == "compiled":
+        path = data / "compiled.jsonl"
+        path.write_bytes(path.read_bytes().replace(b"<system> ", b"<system> changed ", 1))
+    elif fault == "ids":
+        path = data / "ids.json"
+        path.write_bytes(path.read_bytes() + b" ")
+    elif fault == "tokenizer":
+        (base / "tokenizer.json").write_bytes(b"changed")
+    elif fault == "revision":
+        (base / "revision.txt").write_text("b" * 40)
+    elif fault == "missing-proof":
+        proof = None
+    elif fault == "asset-path":
+        proof["tokenizer"]["../unexpected"] = "0" * 64
+    calls = []
+    @contextmanager
+    def attempt(*_args):
+        calls.append("reservation")
+        yield {}, lambda: .9
+    def adapter(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"rows": 96}
+    monkeypatch.setattr(score, "score_adapter", adapter)
+    remote = {"Path": lambda value: tmp_path / str(value).lstrip("/"), "json": json, "hashlib": hashlib,
+              "BASE_DIR": modal_train.BASE_DIR, "_TOKENIZER_FILES": modal_train._TOKENIZER_FILES,
+              "RATES": modal_train.RATES, "MODELS": types.SimpleNamespace(reload=lambda: None), "_attempt": attempt}
+    _modal_ast({"score_fn"}, remote)
+    if fault:
+        with pytest.raises(ValueError):
+            remote["score_fn"]("glimmer-ft-v1", 1, "/data/guide3/ids.json", proof)
+        assert not calls
+    else:
+        result = remote["score_fn"]("glimmer-ft-v1", 1, "/data/guide3/ids.json", proof)
+        assert calls[0] == "reservation" and result["input_sha256"] == proof
+        assert calls[1][1]["ids_from"] == data / "ids.json"
