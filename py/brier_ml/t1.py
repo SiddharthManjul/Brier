@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -52,8 +53,13 @@ def predict_t1(artifact: dict[str, Any], features: NDArray[np.float64]) -> NDArr
     return np.interp(_raw_probabilities(artifact["booster"], matrix), x, y)
 
 
-def train_t1(dataset: Dataset, output: Path) -> dict[str, Any]:
-    """Fit T1 on train, isotonic on calibration, and export engine-readable JSON."""
+def train_t1(dataset: Dataset, output: Path, *,
+             calibration_change_ids: Sequence[str] | None = None) -> dict[str, Any]:
+    """Fit train rows and isotonic on the explicitly selected calibration changes.
+
+    Callers preparing a protected risk bundle must supply the probability-fitting
+    change IDs; omitted IDs retain the generic full-calibration dataset contract.
+    """
     names, labels = dataset["feature_names"], np.asarray(dataset["labels"])
     features = _matrix(dataset["features"], len(names))
     splits = np.asarray(dataset["splits"])
@@ -71,6 +77,14 @@ def train_t1(dataset: Dataset, output: Path) -> dict[str, Any]:
             raise ValueError(f"change {change} appears in multiple splits")
         change_splits[change] = split
     train, calibration = splits == "train", splits == "calibration"
+    if calibration_change_ids is not None:
+        selected = list(calibration_change_ids)
+        available = {change for change, split in zip(dataset["changes"], splits, strict=True)
+                     if split == "calibration"}
+        if (not selected or len(set(selected)) != len(selected)
+                or not set(selected) <= available):
+            raise ValueError("isotonic fitting IDs must be distinct calibration changes")
+        calibration &= np.isin(dataset["changes"], selected)
     if len(np.unique(labels[train])) != 2 or len(np.unique(labels[calibration])) != 2:
         raise ValueError("train and calibration must each contain both regression classes")
     model = LGBMClassifier(
@@ -84,8 +98,8 @@ def train_t1(dataset: Dataset, output: Path) -> dict[str, Any]:
         "format_version": 1, "feature_names": names.copy(),
         "training_change_ids": sorted({change for change, split in zip(dataset["changes"], splits, strict=True)
                                        if split == "train"}),
-        "calibration_change_ids": sorted({change for change, split in zip(dataset["changes"], splits, strict=True)
-                                          if split == "calibration"}),
+        "calibration_change_ids": sorted({change for change, fitted in zip(dataset["changes"], calibration, strict=True)
+                                          if fitted}),
         "booster": model.booster_.dump_model(),
         "isotonic": {"x": isotonic.X_thresholds_.tolist(), "y": isotonic.y_thresholds_.tolist()},
     }
