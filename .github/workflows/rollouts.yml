@@ -1,9 +1,11 @@
 name: Rollouts
+run-name: Rollouts ${{ inputs.env }} ${{ inputs.phase }} N${{ inputs.n_shards }} offset${{ inputs.shard_offset }} count${{ inputs.shard_count }} root=${{ inputs.data_root || 'default' }}
 on:
   workflow_dispatch:
     inputs:
       env: {description: Environment, type: choice, options: [pusht, aloha], required: true}
       phase: {description: Phase, type: choice, options: [timing, baselines, pairs, pilot], required: true}
+      data_root: {description: Isolated private extension root for pairs only; blank uses BRIER_DATA, type: string, default: ''}
       n_shards: {description: Total shards, type: number, default: 40}
       shard_offset: {description: First shard, type: number, default: 0}
       shard_count: {description: Shards in this dispatch, type: number, default: 20}
@@ -21,18 +23,28 @@ jobs:
   setup:
     runs-on: ubuntu-latest
     timeout-minutes: 350
-    outputs: {shards: '${{ steps.plan.outputs.shards }}'}
+    outputs: {shards: '${{ steps.plan.outputs.shards }}', data_root: '${{ steps.plan.outputs.data_root }}'}
     steps:
       - id: plan
-        env: {N: '${{ inputs.n_shards }}', OFFSET: '${{ inputs.shard_offset }}', COUNT: '${{ inputs.shard_count }}', PHASE: '${{ inputs.phase }}'}
+        env: {N: '${{ inputs.n_shards }}', OFFSET: '${{ inputs.shard_offset }}', COUNT: '${{ inputs.shard_count }}', PHASE: '${{ inputs.phase }}', DEFAULT_DATA: '${{ vars.BRIER_DATA }}', DATA_OVERRIDE: '${{ inputs.data_root }}'}
         run: |
           python3 - <<'PY'
-          import json, os
+          import json, os, re
+          def root(value):
+              if not re.fullmatch(r"gs://[a-z0-9][a-z0-9._-]{1,220}[a-z0-9](?:/[A-Za-z0-9._-]+)*/?", value) or any(part in (".", "..") for part in value.split("/")[3:]):
+                  raise SystemExit("data_root and BRIER_DATA must be canonical private gs:// prefixes without traversal or query")
+              return value.rstrip("/")
+          source = root(os.environ['DEFAULT_DATA'])
+          override = os.environ['DATA_OVERRIDE']
+          selected = root(override) if override else source
+          if override and (os.environ['PHASE'] != 'pairs' or not re.fullmatch(re.escape(source) + r"/extensions/guide3-[A-Za-z0-9_-]+", selected)):
+              raise SystemExit("data_root override requires pairs in the configured source/extensions/guide3-<id> private prefix")
           n, offset, count = (int(os.environ[k]) for k in ('N', 'OFFSET', 'COUNT'))
           assert n > 0 and 0 <= offset < n and 1 <= count <= 20 and offset + count <= n, 'Invalid shard range'
           assert os.environ['PHASE'] != 'timing' or (n, offset, count) == (1, 0, 1), 'Timing needs one shard'
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write('shards=' + json.dumps(list(range(offset, offset + count))) + '\n')
+              out.write('data_root=' + selected + '\n')
           PY
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -56,6 +68,7 @@ jobs:
           python -m brier_sim.farm run --env '${{ inputs.env }}' --phase pilot --shard 0 --n-shards 44 --procs 4 --max-hours 5.5
   rollouts:
     needs: setup
+    env: {BRIER_DATA: '${{ needs.setup.outputs.data_root }}'}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:
@@ -79,6 +92,23 @@ jobs:
           python -m pip install uv
           uv pip install --system torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
           uv pip install --system -e .
+      - name: Verify isolated extension provenance before workers
+        if: inputs.data_root != ''
+        env: {SOURCE_DATA: '${{ vars.BRIER_DATA }}', ROLLOUT_ENV: '${{ inputs.env }}'}
+        run: |
+          python - <<'PY'
+          import json, os
+          from brier_sim import farm
+          root = os.environ['BRIER_DATA']
+          manifest = json.loads(farm._read(f"{root}/manifests/extension.json"))
+          source = manifest.get('source_root') if isinstance(manifest, dict) else None
+          if not isinstance(source, str) or source.rstrip('/') != os.environ['SOURCE_DATA'].rstrip('/'):
+              raise SystemExit("Extension manifest must bind the unchanged configured private source")
+          groups = farm._guide_plan(os.environ['ROLLOUT_ENV'], 'pairs')
+          actual = {change['change_id'] for group in groups for change, _, _ in group}
+          if not actual or actual != set(manifest['appended_change_ids'][os.environ['ROLLOUT_ENV']]):
+              raise SystemExit("Farm extension plan does not contain exactly the approved appended changes")
+          PY
       - name: Run assigned work
         run: |
           if [ '${{ inputs.phase }}' = timing ]; then
