@@ -833,3 +833,53 @@ fn report_rejects_malformed_or_cross_repository_pull_request_metadata_before_wri
         );
     }
 }
+
+#[test]
+fn change_guarantee_reports_unrun_selection_as_not_needed_after_complete_blocking_wave() {
+    let fixture = Fixture::new(&["expensive"; 8], true);
+    fixture.connection.execute_batch("DROP TRIGGER decisions_no_UPDATE; UPDATE decisions SET probs_json=json_set(probs_json,'$.policy.guarantee','change','$.policy.certified',json('true'),'$.policy.run_all',json('false'),'$.policy.risk_bound',0.05,'$.policy.guarantee_metric','unconditional_change_miss');").unwrap();
+    for index in 1..=4 {
+        fixture.run(index, 20, if index == 1 { 5 } else { 20 }, 40.0);
+        fixture.label(index, index == 1);
+    }
+    let output = report(&fixture.ledger, "c002", &fixture.out, None, None).unwrap();
+    assert_eq!(output.verdict, "block");
+    assert!(output.bundle.is_some());
+    assert!(output.markdown.contains("Not needed after BLOCK: 4"));
+    assert!(output.markdown.contains("0 pending"));
+    assert!(output
+        .markdown
+        .contains("not needed: verdict already BLOCK"));
+    assert!(output.markdown.contains("unconditional change-level"));
+    assert!(output.markdown.contains("full=true"));
+    assert_eq!(
+        fixture
+            .connection
+            .query_row(
+                "SELECT count(*) FROM decisions WHERE reason='threshold'",
+                [],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+        8
+    );
+    fixture.run(5, 19, 5, 40.0);
+    let partial = report(&fixture.ledger, "c002", &fixture.out, None, None).unwrap();
+    assert!(partial.bundle.is_none());
+    assert!(partial.markdown.contains("1 pending"));
+}
+
+#[test]
+fn unselected_regression_cannot_clear_pending_selected_work() {
+    let fixture = Fixture::new(&["skip", "expensive"], true);
+    fixture.connection.execute_batch("DROP TRIGGER decisions_no_UPDATE; UPDATE decisions SET probs_json=json_set(probs_json,'$.policy.guarantee','change');").unwrap();
+    fixture.run(1, 20, 5, 40.0);
+    fixture.label(1, true);
+    let output = report(&fixture.ledger, "c002", &fixture.out, None, None).unwrap();
+    assert_eq!(output.verdict, "pending");
+    assert!(output.bundle.is_none());
+    assert!(output.markdown.contains("Not needed after BLOCK: 0"));
+    assert!(!output
+        .markdown
+        .contains("not needed: verdict already BLOCK"));
+}
