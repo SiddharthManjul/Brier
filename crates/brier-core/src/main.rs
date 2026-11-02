@@ -20,6 +20,8 @@ enum Command {
         ledger: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        #[arg(long)]
+        heldout_from: Option<String>,
     },
     Label {
         #[arg(long)]
@@ -52,6 +54,8 @@ enum Command {
         change: String,
         #[arg(long, default_value_t = brier_core::policy::DEFAULT_ALPHA)]
         alpha: f64,
+        #[arg(long, value_enum, default_value = "change")]
+        guarantee: brier_core::policy::Guarantee,
     },
     Replay {
         #[arg(long)]
@@ -59,13 +63,20 @@ enum Command {
         #[arg(long)]
         compiled: PathBuf,
         #[arg(long)]
-        scores: PathBuf,
+        #[arg(required_unless_present = "probs", conflicts_with = "probs")]
+        scores: Option<PathBuf>,
+        #[arg(long, conflicts_with = "scores")]
+        probs: Option<PathBuf>,
         #[arg(long)]
         out: PathBuf,
         #[arg(long, default_value_t = brier_core::policy::DEFAULT_ALPHA)]
         alpha: f64,
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        #[arg(long, value_delimiter = ',')]
+        alphas: Option<Vec<f64>>,
+        #[arg(long, value_enum)]
+        guarantee: Option<brier_core::policy::Guarantee>,
     },
     Report {
         #[arg(long)]
@@ -98,7 +109,11 @@ enum LedgerCommand {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Compile { ledger, out } => compile::compile(&ledger, &out)?,
+        Command::Compile {
+            ledger,
+            out,
+            heldout_from,
+        } => compile::compile_heldout(&ledger, &out, heldout_from.as_deref())?,
         Command::Label {
             ledger,
             episodes,
@@ -123,9 +138,16 @@ fn main() -> Result<()> {
             calibration,
             change,
             alpha,
+            guarantee,
         } => {
-            let report =
-                brier_core::decide::decide(&ledger, &compiled, &calibration, &change, alpha)?;
+            let report = brier_core::decide::decide_guarantee(
+                &ledger,
+                &compiled,
+                &calibration,
+                &change,
+                alpha,
+                guarantee,
+            )?;
             println!("{}", serde_json::to_string(&report)?);
         }
         Command::Replay {
@@ -135,10 +157,34 @@ fn main() -> Result<()> {
             out,
             alpha,
             seed,
+            probs,
+            alphas,
+            guarantee,
         } => {
-            brier_core::replay_report::write_report(
-                &ledger, &compiled, &scores, &out, alpha, seed,
-            )?;
+            if let Some(probs) = probs {
+                brier_core::replay_report::write_guide3_report(
+                    &ledger,
+                    &compiled,
+                    &probs,
+                    &out,
+                    &alphas.unwrap_or_else(|| vec![0.05, 0.10]),
+                    guarantee.unwrap_or(brier_core::policy::Guarantee::Change),
+                    seed,
+                )?;
+            } else {
+                anyhow::ensure!(
+                    alphas.is_none() && guarantee.is_none(),
+                    "Guide 3 --alphas/--guarantee require --probs with ev/noev scores"
+                );
+                brier_core::replay_report::write_report(
+                    &ledger,
+                    &compiled,
+                    &scores.unwrap(),
+                    &out,
+                    alpha,
+                    seed,
+                )?;
+            }
         }
         Command::Report {
             ledger,
