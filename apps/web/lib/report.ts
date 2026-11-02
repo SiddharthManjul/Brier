@@ -22,13 +22,22 @@ function record(value: Json | undefined, path: string): Record<string, Json> {
   return value;
 }
 
+function boundedMetric(value: Json | undefined, name: string, min: number, max = Infinity): number | null {
+  const measured = metric(value);
+  if (measured !== null && (measured < min || measured > max)) {
+    throw new Error(`${name} must be between ${min} and ${max}`);
+  }
+  return measured;
+}
+
 /** Read test metrics and chart points while keeping OOD calibration separate. */
 export function readStrategies(body: Record<string, Json>): Strategy[] {
   if (body.strategies === undefined) return [];
   return Object.entries(record(body.strategies, "strategies")).map(([name, value]) => {
     const metrics = record(value, `strategies.${name}`);
     const test = metrics.test_metrics == null ? {} : record(metrics.test_metrics, "test_metrics");
-    const oodEce = metrics.ood_metrics == null ? null : metric(record(metrics.ood_metrics, "ood_metrics").ece);
+    const oodEce = metrics.ood_metrics == null ? null
+      : boundedMetric(record(metrics.ood_metrics, "ood_metrics").ece, "OOD ECE", 0, 1);
     const guarantee = metric(metrics.guarantee_splits);
     if (guarantee !== null && (!Number.isInteger(guarantee) || guarantee < 0 || guarantee > 20)) {
       throw new Error("guarantee_splits must be an integer in [0, 20]");
@@ -39,8 +48,17 @@ export function readStrategies(body: Record<string, Json>): Strategy[] {
     if (curve !== undefined && !Array.isArray(curve)) throw new Error("threshold_curve must be an array");
     return {
       name, metrics: {
-        ...metrics, ece: metric(test.ece), brier: metric(test.brier),
-        nll: metric(test.nll), auroc: metric(test.auroc),
+        ...metrics,
+        ece: boundedMetric(test.ece, "Test ECE", 0, 1),
+        brier: boundedMetric(test.brier, "Test Brier score", 0, 1),
+        nll: boundedMetric(test.nll, "Test NLL", 0),
+        auroc: boundedMetric(test.auroc, "Test AUROC", 0, 1),
+        eval_hours_saved: boundedMetric(metrics.eval_hours_saved, "Evaluation hours saved", -Infinity, 1),
+        missed_regression_fraction: boundedMetric(metrics.missed_regression_fraction, "Missed regression fraction", 0, 1),
+        change_recall: boundedMetric(metrics.change_recall, "Change recall", 0, 1),
+        p50_latency_seconds: boundedMetric(metrics.p50_latency_seconds, "p50 latency", 0),
+        p95_latency_seconds: boundedMetric(metrics.p95_latency_seconds, "p95 latency", 0),
+        cost_usd_per_change: boundedMetric(metrics.cost_usd_per_change, "Cost per change", 0),
       }, oodEce,
       reliability: (reliability ?? []).map((value) => {
         const point = record(value, "reliability bin");
@@ -52,9 +70,9 @@ export function readStrategies(body: Record<string, Json>): Strategy[] {
       }),
       curve: (curve ?? []).flatMap((value) => {
         const point = record(value, "threshold curve point");
-        const saved = metric(point.eval_hours_saved), missed = metric(point.missed_regression_fraction);
+        const saved = boundedMetric(point.eval_hours_saved, "Threshold evaluation hours saved", -Infinity, 1);
+        const missed = boundedMetric(point.missed_regression_fraction, "Threshold missed regression fraction", 0, 1);
         if (saved === null || missed === null) return [];
-        if (saved < 0 || saved > 1 || missed < 0 || missed > 1) throw new Error("Threshold curve fractions are out of range");
         return [{ saved: saved * 100, missed: missed * 100 }];
       }).sort((a, b) => a.saved - b.saved),
     };
