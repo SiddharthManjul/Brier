@@ -190,3 +190,9 @@ test("ingest accepts both ALOHA scenario aliases without weakening environment m
     assert.throws(() => validateIngest(input), /scenarioId/);
   }
 });
+
+test("ingest validates Guide 3 diagnostics before storing their risk claims", () => {
+  const input = fixture();
+  Object.assign(input.report.body, { guide3: { guarantee: "change", guarantee_denominator: "regressing changes" } });
+  assert.throws(() => validateIngest(input), /denominator/);
+});
