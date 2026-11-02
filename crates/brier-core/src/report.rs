@@ -21,6 +21,7 @@ struct Logged {
     lambda: f64,
     action: String,
     created: String,
+    reason: String,
 }
 
 struct Measured {
@@ -316,7 +317,7 @@ pub fn report(
         .context("change card requires a nonempty desc or description")?;
     let pr_url = pull_request_url()?;
     let mut query = connection.prepare(
-        "SELECT decision_id,scenario_id,model_version,probs_json,lambda,action,created_at
+        "SELECT decision_id,scenario_id,model_version,probs_json,lambda,action,created_at,reason
         FROM decisions WHERE change_id=?1 ORDER BY scenario_id",
     )?;
     let decisions = query
@@ -329,6 +330,7 @@ pub fn report(
                 lambda: row.get(4)?,
                 action: row.get(5)?,
                 created: row.get(6)?,
+                reason: row.get(7)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -366,7 +368,8 @@ pub fn report(
             && unique.len() == risk_ids.len()
             && !unique.contains("")
             && !unique.contains(change)
-            && 1.0 / (policy.calibration_changes as f64 + 1.0) <= policy.alpha,
+            && (1.0 / (policy.calibration_changes as f64 + 1.0) <= policy.alpha
+                || first["policy"]["run_all"] == true),
         "invalid persisted risk policy provenance"
     );
     for field in ["model_version", "t1_model_version"] {
@@ -386,6 +389,9 @@ pub fn report(
     let (mut selected, mut completed, mut confirmed, mut pending) = (0, 0, 0, 0);
     let (mut total_seconds, mut selected_seconds, mut timed) = (0.0, 0.0, true);
     let mut table = String::new();
+    let early_stop = first["policy"]["guarantee"] == "change" && connection.query_row("SELECT EXISTS(SELECT 1 FROM labels l JOIN runs r USING(change_id,scenario_id) JOIN decisions d USING(change_id,scenario_id) WHERE l.change_id=?1 AND d.action='expensive' AND l.regressed=1 AND r.tier='expensive' AND r.episodes=20)",[change],|row|row.get::<_,bool>(0))?;
+    let mut not_needed = 0;
+    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
     let media_root = match env::var("BRIER_DATA") {
         Ok(value) => Some(value),
         Err(env::VarError::NotPresent) => None,
@@ -422,7 +428,11 @@ pub fn report(
             "unknown decision action"
         );
         ensure!(
-            decision.action != "skip" || probability < policy.lambda,
+            decision.action != "skip"
+                || probability < policy.lambda
+                || scores["noev_probability"]
+                    .as_f64()
+                    .is_some_and(|p| p < crate::policy::LAMBDA_LOW),
             "skipped decision violates its calibrated threshold"
         );
         let prefix = format!("{env}-s");
@@ -531,13 +541,24 @@ pub fn report(
                             "explanation":explanation}));
                     }
                 }
+            } else if early_stop && run.is_none() {
+                not_needed += 1;
             } else {
                 pending += 1;
             }
         }
+        let reason = if chosen && early_stop && run.is_none() {
+            "early_stop_not_needed"
+        } else {
+            &decision.reason
+        };
+        *reasons.entry(reason.to_string()).or_default() += 1;
         let outcome = match (result, after) {
             (Some(result), Some(rate)) => {
                 format!("{} {:.2} → {:.2}", result.to_uppercase(), baseline, rate)
+            }
+            _ if reason == "early_stop_not_needed" => {
+                "not needed: verdict already BLOCK (early_stop_not_needed)".to_string()
             }
             _ if chosen => "PENDING expensive run or label".to_string(),
             _ => "n/a".to_string(),
@@ -565,9 +586,24 @@ pub fn report(
     );
     let hours_saved =
         (timed && total_seconds > 0.0).then(|| 100.0 * (1.0 - selected_seconds / total_seconds));
-    let mut markdown = format!("## Brier: {} ({confirmed} regressions confirmed)\n\n{}\n\nGuarantee target: expected missed-regression fraction ≤ {:.1}% (λ = {:.3}, calibrated on {} changes), assuming exchangeable changes.\n\nExpensive evaluations: {completed} completed of {} scenarios; {selected} selected, {pending} pending.\nEvaluation-count reduction: {:.1}% vs run-all.\n",
-        verdict.to_uppercase(), md(title), policy.alpha * 100.0, policy.lambda, policy.calibration_changes,
-        decisions.len(), 100.0 * (1.0 - selected as f64 / decisions.len() as f64));
+    let guarantee = match first["policy"]["guarantee"].as_str() {
+        Some("change") => "unconditional change-level miss fraction across all changes",
+        _ => "mean per-change fraction of regressing scenarios missed",
+    };
+    let certificate = if first["policy"]["certified"] == false {
+        "Calibration uncertified; structural run-all policy retains every scenario. No CRC certificate is claimed.".to_string()
+    } else {
+        format!("Guarantee target: expected {guarantee} ≤ {:.1}% (λ = {:.3}, calibrated on {} changes), assuming exchangeable changes.",policy.alpha*100.0,policy.lambda,policy.calibration_changes)
+    };
+    let mut markdown = format!("## Brier: {} ({confirmed} regressions confirmed)\n\n{}\n\n{certificate}\n\nExpensive evaluations: {completed} completed of {} scenarios; {selected} selected, {pending} pending.\nEvaluation-count reduction: {:.1}% vs run-all.\n",
+        verdict.to_uppercase(), md(title), decisions.len(), 100.0 * (1.0 - if pending == 0 {completed} else {selected} as f64 / decisions.len() as f64));
+    if first["policy"]["guarantee"] == "change" {
+        markdown.push_str("The bound is unconditional across all changes; it does not bound conditional misses among regressing changes. Scenario-level misses are measured alongside it in the replay report.\n");
+    }
+    markdown.push_str(&format!("Not needed after BLOCK: {not_needed}. Decision reasons: {}.\nRun full suite: re-run Robot CI with workflow_dispatch input `full=true`.\n", serde_json::to_string(&reasons)?));
+    if not_needed > 0 {
+        markdown.push_str("The append-only ledger retains original selection reasons; early_stop_not_needed is the derived execution outcome.\n");
+    }
     if let Some(saved) = hours_saved {
         markdown.push_str(&format!(
             "Measured expensive hours: {:.4} selected / {:.4} run-all ({saved:.1}% saved).\n",
