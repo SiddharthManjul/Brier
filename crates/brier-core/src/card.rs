@@ -76,9 +76,19 @@ fn read_snapshot(path: &Path) -> Result<Snapshot> {
         snapshot.logging.is_null() || snapshot.logging.is_object(),
         "logging metadata must be an object"
     );
-    crate::cascade::change_features(
-        &json!({"description":snapshot.description,"families":snapshot.families}),
-    )?;
+    let guide = snapshot.families.iter().any(|family| {
+        family
+            .params
+            .keys()
+            .any(|key| matches!(key.as_str(), "s" | "b" | "shift" | "fraction"))
+    });
+    let numeric_card = if guide {
+        json!({"change_id":"c001", "env":if snapshot.env.contains("PushT") { "pusht" } else { "aloha" },
+            "desc":snapshot.description,"seed":0,"families":snapshot.families})
+    } else {
+        json!({"description":snapshot.description,"families":snapshot.families})
+    };
+    crate::cascade::change_features(&numeric_card)?;
     for family in &snapshot.families {
         for (key, value) in &family.params {
             let number = value
@@ -86,20 +96,23 @@ fn read_snapshot(path: &Path) -> Result<Snapshot> {
                 .context("change parameters must be numeric")?;
             if matches!(
                 key.as_str(),
-                "k" | "dx" | "dy" | "x" | "y" | "width" | "height" | "n_action_steps"
+                "k" | "dx" | "dy" | "x" | "y" | "width" | "height" | "shift" | "n_action_steps"
             ) {
                 ensure!(value.as_i64().is_some(), "{key} must be an integer");
             }
-            if matches!(key.as_str(), "sigma" | "gain" | "contrast" | "x" | "y") {
+            if matches!(
+                key.as_str(),
+                "sigma" | "gain" | "contrast" | "x" | "y" | "b"
+            ) {
                 ensure!(number >= 0.0, "{key} must be nonnegative");
             }
             if matches!(
                 key.as_str(),
-                "k" | "scale" | "width" | "height" | "n_action_steps"
+                "k" | "scale" | "s" | "width" | "height" | "shift" | "n_action_steps" | "fraction"
             ) {
                 ensure!(number > 0.0, "{key} must be positive");
             }
-            if key == "p" {
+            if matches!(key.as_str(), "p" | "fraction") {
                 ensure!(
                     (0.0..=1.0).contains(&number),
                     "p must be between zero and one"
