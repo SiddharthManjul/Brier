@@ -137,6 +137,24 @@ def test_early_terminal_fills_unreached_keyframes_and_denominator(monkeypatch: p
     assert json.loads(row["terminal_state_json"])["block_pose"][0] == 13
 
 
+@pytest.mark.parametrize("finish", [3, 4])
+def test_live_cheap_frame_capture_preserves_native_measurements_actions_and_seed(
+    monkeypatch: pytest.MonkeyPatch, finish: int,
+) -> None:
+    children, results = [], []
+    for capture in (False, True):
+        child = _Child(finish=finish, success=True)
+        children.append(child)
+        loaded = _loaded(monkeypatch, child)
+        results.append(runner._guide_episode(loaded, "pusht", _scenario(), "cheap", 17,
+                                              capture_cheap_frame=capture))
+    assert results[0][0] == results[1][0]
+    assert results[0][1] == [] and len(results[1][1]) == 1
+    assert children[0].seed == children[1].seed == 17
+    np.testing.assert_array_equal(children[0].actions, children[1].actions)
+    np.testing.assert_array_equal(results[1][1][0], runner._guide_frame(children[1].observation(), "pusht"))
+
+
 def test_hook_order_and_raw_keyframes_precede_perturbations(monkeypatch: pytest.MonkeyPatch) -> None:
     child, events = _Child(finish=1), []
     loaded = _loaded(monkeypatch, child)
