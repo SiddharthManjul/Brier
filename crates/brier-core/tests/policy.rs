@@ -114,3 +114,67 @@ fn rejects_empty_identifiers_and_empty_scenario_groups() {
     changes[0].pairs.clear();
     assert!(calibrate(&changes, DEFAULT_ALPHA).is_err());
 }
+
+#[test]
+fn executed_change_crc_is_less_strict_and_names_the_unconditional_denominator() {
+    use brier_core::policy::{
+        calibrate_executed, executed_loss, selected, ExecutedChange, ExecutedPair, Guarantee,
+    };
+    let changes: Vec<_> = (0..30)
+        .map(|i| ExecutedChange {
+            change_id: format!("c{i:03}"),
+            pairs: [0.1, 0.8]
+                .into_iter()
+                .enumerate()
+                .map(|(j, p)| ExecutedPair {
+                    scenario_id: format!("s{j}"),
+                    probability: p,
+                    noev_probability: 0.5,
+                    regressed: true,
+                })
+                .collect(),
+        })
+        .collect();
+    let change = calibrate_executed(&changes, 0.05, Guarantee::Change).unwrap();
+    let scenario = calibrate_executed(&changes, 0.05, Guarantee::Scenario).unwrap();
+    assert_eq!(change.lambda, 0.8);
+    assert_eq!(scenario.lambda, 0.1);
+    assert_eq!(change.guarantee_metric, "unconditional_change_miss");
+    assert!(change.certified && !change.run_all);
+    assert_eq!(
+        executed_loss(&changes[0], 0.8, Guarantee::Change).unwrap(),
+        0.0
+    );
+    assert_eq!(
+        executed_loss(&changes[0], 0.8, Guarantee::Scenario).unwrap(),
+        0.5
+    );
+    assert!(!selected(&changes[0].pairs[0], &change));
+    assert!(selected(&changes[0].pairs[1], &change));
+}
+
+#[test]
+fn uncertified_small_samples_and_fixed_low_misses_use_explicit_safe_run_all() {
+    use brier_core::policy::{
+        calibrate_executed, selected, ExecutedChange, ExecutedPair, Guarantee,
+    };
+    let mut changes: Vec<_> = (0..30)
+        .map(|i| ExecutedChange {
+            change_id: format!("c{i:03}"),
+            pairs: vec![ExecutedPair {
+                scenario_id: "s01".into(),
+                probability: 0.8,
+                noev_probability: 0.01,
+                regressed: true,
+            }],
+        })
+        .collect();
+    for pool in [&changes[..15], &changes[..]] {
+        let policy = calibrate_executed(pool, 0.05, Guarantee::Change).unwrap();
+        assert!(policy.run_all && !policy.certified);
+        assert_eq!(policy.lambda, 0.0);
+        assert!(selected(&pool[0].pairs[0], &policy));
+    }
+    changes[0].pairs[0].noev_probability = f64::NAN;
+    assert!(calibrate_executed(&changes, 0.05, Guarantee::Change).is_err());
+}
