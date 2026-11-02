@@ -131,9 +131,9 @@ export function validateIngest(value: unknown): IngestBundle {
     const p = object(value, ["id", "evaluationId", "scenarioId", "pRegress", "action", "result", "successBefore", "successAfter"], path);
     const evaluationId = uuid(p.evaluationId, `${path}.evaluationId`);
     const scenarioId = text(p.scenarioId, `${path}.scenarioId`);
-    const prefix = `${change.env}-s`;
+    const prefixes = change.env === "aloha_transfer_cube" ? ["aloha-s", "aloha_transfer_cube-s"] : [`${change.env}-s`];
     if (evaluationId !== evaluation.id) throw new Error(`${path}.evaluationId must match evaluation.id`);
-    if (!scenarioId.startsWith(prefix) || !/^(0[1-9]|[1-9]\d)$/.test(scenarioId.slice(prefix.length))) {
+    if (!prefixes.some((prefix) => scenarioId.startsWith(prefix) && /^(0[1-9]|[1-9]\d)$/.test(scenarioId.slice(prefix.length)))) {
       throw new Error(`${path}.scenarioId must match the change environment`);
     }
     return {
